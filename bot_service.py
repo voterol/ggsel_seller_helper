@@ -903,6 +903,13 @@ class BotService:
     async def handle_callback(self, data: str, update, context):
         """Обработка inline кнопок"""
         query = update.callback_query
+        
+        # Для команды /auto - отправляем новое сообщение (query будет None)
+        if data == "auto_menu_new":
+            chat_id = update.effective_chat.id
+            await self.send_auto_menu_new(chat_id)
+            return
+        
         message = query.message
         chat_id = message.chat.id
         message_id = message.message_id
@@ -1210,6 +1217,41 @@ class BotService:
         ]
         
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
+    
+    async def send_auto_menu_new(self, chat_id: int):
+        """Отправить новое сообщение с меню автоответов (для команды /auto)"""
+        enabled = self.autoresponder.is_enabled()
+        first_enabled = self.autoresponder.is_first_message_enabled()
+        triggers_count = len(self.autoresponder.get_triggers())
+        review_enabled = self.autoresponder.is_review_responses_enabled()
+        csv_enabled = self.autoresponder.is_csv_mode_enabled()
+        csv_rules_count = len(self.autoresponder.get_csv_rules())
+        
+        text = f"⚙️ Настройки автоответов\n\n"
+        text += f"Статус: {'✅ Включено' if enabled else '❌ Выключено'}\n"
+        text += f"Приветствие: {'✅' if first_enabled else '❌'}\n"
+        text += f"Триггеров: {triggers_count}\n"
+        text += f"Ответы на отзывы: {'✅' if review_enabled else '❌'}\n"
+        text += f"Режим ЧСВ: {'✅' if csv_enabled else '❌'} ({csv_rules_count})"
+        
+        keyboard = [
+            [InlineKeyboardButton(
+                f"{'🔴 Выключить' if enabled else '🟢 Включить'}", 
+                callback_data="auto_toggle"
+            )],
+            [InlineKeyboardButton(
+                f"👋 Приветствие {'✅' if first_enabled else '❌'}", 
+                callback_data="auto_first_toggle"
+            )],
+            [InlineKeyboardButton("✏️ Текст приветствия", callback_data="auto_first_edit")],
+            [InlineKeyboardButton(f"📝 Триггеры ({triggers_count})", callback_data="auto_triggers")],
+            [InlineKeyboardButton(f"⭐ Ответы на отзывы {'✅' if review_enabled else '❌'}", callback_data="auto_reviews")],
+            [InlineKeyboardButton(f"🎯 Режим ЧСВ {'✅' if csv_enabled else '❌'} ({csv_rules_count})", callback_data="csv_menu")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+            [InlineKeyboardButton("❌ Закрыть", callback_data="close")]
+        ]
+        
+        await self.telegram_bot.send_message_with_keyboard(text, keyboard, None)
     
     async def show_csv_menu(self, chat_id: int, message_id: int):
         """Показать меню режима ЧСВ."""

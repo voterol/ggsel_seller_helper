@@ -102,12 +102,14 @@ class TelegramBot:
         )
     
     async def _handle_auto_command(self, update: Update, context):
-        """Команда /auto - меню автоответов"""
+        """Команда /auto - меню автоответов (отправляет новое сообщение)"""
         if update.effective_chat.id != self.group_id:
             return
         
+        # Для команды /auto отправляем новое сообщение с меню
+        # (callback_handler ожидает callback_query, а не команду)
         if self.callback_handler:
-            await self.callback_handler("auto_menu", update, context)
+            await self.callback_handler("auto_menu_new", update, context)
     
     async def _handle_history_command(self, update: Update, context):
         """Команда /history - загрузка истории в топик"""
