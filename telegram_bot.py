@@ -12,9 +12,7 @@ class TelegramBot:
         self.config = config
         self.bot = Bot(token=config.telegram_bot_token)
         self.group_id = config.telegram_group_id
-        self.orders_group_id = config.orders_group_id
         self.application = None
-        self.order_message_handler = None
         self.topic_message_handler = None
         self.callback_handler = None  # Обработчик inline кнопок
         self.command_handler = None   # Обработчик команд
@@ -47,11 +45,6 @@ class TelegramBot:
             # Callback для inline кнопок
             self.application.add_handler(CallbackQueryHandler(self._handle_callback))
             
-            # Обработчик заказов
-            if self.orders_group_id and self.order_message_handler:
-                order_filter = filters.Chat(chat_id=self.orders_group_id) & filters.TEXT
-                self.application.add_handler(MessageHandler(order_filter, self._handle_order_message))
-            
             # Обработчик сообщений в топиках
             if self.topic_message_handler:
                 topic_filter = filters.Chat(chat_id=self.group_id) & filters.TEXT & filters.IS_TOPIC_MESSAGE
@@ -76,9 +69,6 @@ class TelegramBot:
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
-    
-    def set_order_message_handler(self, handler: Callable[[str], None]):
-        self.order_message_handler = handler
     
     def set_topic_message_handler(self, handler: Callable[[int, str, str, int], None]):
         self.topic_message_handler = handler
@@ -190,17 +180,6 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"Ошибка обработки топика: {e}")
     
-    async def _handle_order_message(self, update: Update, context):
-        """Обработка заказов"""
-        try:
-            if update.message and update.message.text:
-                text = update.message.text
-                if "НОВЫЙ ЗАКАЗ" in text and "ID_I:" in text:
-                    if self.order_message_handler:
-                        self.order_message_handler(text)
-        except Exception as e:
-            logging.error(f"Ошибка обработки заказа: {e}")
-    
     async def _handle_general_message(self, update: Update, context):
         """Обработка сообщений в General (для настроек)"""
         try:
@@ -215,60 +194,33 @@ class TelegramBot:
             logging.error(f"Ошибка обработки General: {e}")
     
     async def create_topic(self, topic_name: str) -> Tuple[Optional[int], Optional[int]]:
-        """Создание топика с улучшенной обработкой ошибок"""
+        """Создание топика"""
+        # Ограничение длины названия (Telegram лимит 128)
+        if len(topic_name) > 120:
+            topic_name = topic_name[:120] + "..."
+        
         for attempt in range(self.config.max_retries):
             try:
-                # Добавляем задержку между попытками для избежания flood control
-                if attempt > 0:
-                    await asyncio.sleep(self.config.retry_delay * attempt)
-                
                 result = await self.bot.create_forum_topic(chat_id=self.group_id, name=topic_name)
-                logging.info(f"Топик '{topic_name}' создан успешно (ID: {result.message_thread_id})")
                 return result.message_thread_id, None
-                
             except TelegramError as e:
                 err = str(e).lower()
-                logging.warning(f"Ошибка создания топика (попытка {attempt + 1}): {e}")
-                
                 if "not a forum" in err:
-                    logging.error("Группа не является форумом!")
                     return -1, None
                 elif "flood control" in err or "too many requests" in err:
-                    cooldown = self._extract_cooldown(str(e))
-                    logging.warning(f"Flood control: ждём {cooldown}s")
-                    return None, cooldown
+                    return None, self._extract_cooldown(str(e))
                 elif "bot was kicked" in err or "forbidden" in err:
-                    logging.error("Бот исключён из группы или нет прав!")
                     return None, None
                 elif "timed out" in err or "timeout" in err:
                     if attempt < self.config.max_retries - 1:
-                        logging.info(f"Таймаут, повторяем через {self.config.retry_delay}s...")
                         await asyncio.sleep(self.config.retry_delay)
                         continue
-                elif "bad request" in err:
-                    # Возможно, проблема с именем топика
-                    if len(topic_name) > 128:
-                        topic_name = topic_name[:125] + "..."
-                        logging.info(f"Обрезаем имя топика: {topic_name}")
-                        continue
-                    else:
-                        logging.error(f"Некорректный запрос: {e}")
-                        return None, None
-                else:
-                    logging.error(f"Неизвестная ошибка Telegram: {e}")
-                    if attempt < self.config.max_retries - 1:
-                        continue
-                
                 return None, None
-                
-            except Exception as e:
-                logging.error(f"Неожиданная ошибка создания топика (попытка {attempt + 1}): {e}")
+            except Exception:
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(self.config.retry_delay)
                     continue
                 return None, None
-        
-        logging.error(f"Не удалось создать топик после {self.config.max_retries} попыток")
         return None, None
     
     def _extract_cooldown(self, error: str) -> int:
@@ -286,6 +238,10 @@ class TelegramBot:
     
     async def send_message(self, text: str, topic_id: int) -> Tuple[bool, Optional[int]]:
         """Отправка сообщения"""
+        # Ограничение длины (Telegram лимит 4096)
+        if len(text) > 4000:
+            text = text[:4000] + "..."
+        
         for attempt in range(self.config.max_retries):
             try:
                 if topic_id == -1:
@@ -368,33 +324,28 @@ class TelegramBot:
         """Получить список всех топиков в группе"""
         try:
             topics = []
-            # Telegram API не даёт получить список топиков напрямую,
-            # но можно получить через getForumTopicIconStickers или проверить конкретный топик
-            # Используем workaround - пробуем отправить в топик и ловим ошибку
+            # Telegram API не даёт получить список топиков напрямую
             return topics
         except Exception as e:
             logging.error(f"Ошибка получения топиков: {e}")
             return []
     
-    async def check_topic_exists(self, topic_id: int) -> bool:
-        """Проверить существует ли топик"""
+    async def check_topic_exists(self, topic_id: int, topic_name: str = None) -> bool:
+        """Проверить существует ли топик через edit_forum_topic"""
         try:
-            # Отправляем точку и сразу удаляем
-            msg = await self.bot.send_message(
+            # Пробуем отредактировать топик (ставим то же название)
+            # Если топик удалён - получим ошибку
+            name = topic_name or "💬"
+            await self.bot.edit_forum_topic(
                 chat_id=self.group_id,
                 message_thread_id=topic_id,
-                text="."
+                name=name
             )
-            # Сразу удаляем
-            try:
-                await self.bot.delete_message(chat_id=self.group_id, message_id=msg.message_id)
-            except:
-                pass
             return True
         except Exception as e:
             err = str(e).lower()
             # Topic_deleted или not found = топик удалён
-            if "deleted" in err or "not found" in err or "invalid" in err or "thread" in err:
+            if "deleted" in err or "not found" in err or "invalid" in err or "thread" in err or "message_thread_id" in err:
                 return False
-            # Другие ошибки - считаем что топик существует
+            # Другие ошибки (например rate limit) - считаем что топик существует
             return True
