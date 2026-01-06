@@ -20,7 +20,7 @@
 
 ```bash
 git clone https://github.com/voterol/ggsel_seller_helper/
-cd ggsel-bot/ggsel_bot
+cd ggsel_seller_helper/
 ```
 
 ### 2. Создайте виртуальное окружение (рекомендуется)
@@ -192,3 +192,4 @@ ggsel_bot/
 ## 📝 Лицензия
 
 MIT
+
