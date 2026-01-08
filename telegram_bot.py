@@ -332,16 +332,15 @@ class TelegramBot:
             logging.error(f"Ошибка получения топиков: {e}")
             return []
     
-    async def check_topic_exists(self, topic_id: int, topic_name: str = None) -> bool:
+    async def check_topic_exists(self, topic_id: int, topic_name: str) -> bool:
         """Проверить существует ли топик через edit_forum_topic"""
         try:
             # Пробуем отредактировать топик (ставим то же название)
             # Если топик удалён - получим ошибку
-            name = topic_name or "💬"
             await self.bot.edit_forum_topic(
                 chat_id=self.group_id,
                 message_thread_id=topic_id,
-                name=name
+                name=topic_name
             )
             return True
         except Exception as e:

@@ -106,6 +106,15 @@ class TopicManager:
         else:
             logging.warning(f"Топик {topic_key} не найден для обновления chat_ids")
     
+    def remove_topic(self, topic_key: str) -> bool:
+        """Удаление топика из базы"""
+        if topic_key in self.topics:
+            del self.topics[topic_key]
+            self.save_topics()
+            logging.info(f"Топик {topic_key} удалён из базы")
+            return True
+        return False
+    
     def update_topic_search_time(self, topic_key: str, search_time: str) -> None:
         """Обновление времени последнего поиска чатов для топика"""
         if topic_key in self.topics:

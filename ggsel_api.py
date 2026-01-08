@@ -1,4 +1,6 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import hashlib
 import time
 import json
@@ -13,6 +15,16 @@ class GGSelAPI:
         self.base_url = config.ggsel_base_url
         self.token: Optional[str] = None
         self.session = requests.Session()
+        
+        # Увеличиваем пул соединений для параллельных запросов
+        adapter = HTTPAdapter(
+            pool_connections=30,
+            pool_maxsize=30,
+            max_retries=Retry(total=2, backoff_factor=0.5)
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+        
         self.session.headers.update({
             'Content-Type': 'text/xml',
             'Accept': 'application/json'
@@ -222,18 +234,29 @@ class GGSelAPI:
                 chats.append(chat)
         return chats
     
-    def get_reviews(self, count: int = 20, review_type: str = "all", page: int = 1) -> Optional[Dict[str, Any]]:
-        """Получение отзывов"""
+    def get_reviews(self, count: int = 20, review_type: str = "all", page: int = 1, product_id: int = None) -> Optional[Dict[str, Any]]:
+        """Получение отзывов
+        
+        Args:
+            count: количество отзывов (default 20)
+            review_type: тип отзывов - 'good', 'bad', 'all' (default 'all')
+            page: номер страницы (default 1)
+            product_id: ID товара для фильтрации (опционально)
+        """
         if not self.token and not self.login():
             return None
         
-        url = f"{self.base_url}/reviews"
+        # Правильный эндпоинт согласно документации
+        url = "https://seller.ggsel.net/api_sellers/api/reviews"
         params = {
             'token': self.token,
             'type': review_type,
             'page': page,
             'count': count
         }
+        if product_id:
+            params['product_id'] = product_id
+            
         headers = {'Accept': 'application/json', 'locale': 'ru-RU'}
         
         try:

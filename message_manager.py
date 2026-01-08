@@ -1,5 +1,6 @@
 import json
 import os
+import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -7,6 +8,7 @@ class MessageManager:
     def __init__(self, messages_file: str = "processed_messages.json"):
         self.messages_file = messages_file
         self.processed_messages: Dict[str, Dict] = self.load_messages()
+        self._lock = asyncio.Lock()  # Блокировка для атомарных операций
     
     def load_messages(self) -> Dict[str, Dict]:
         """Загрузка проверенных сообщений из JSON файла"""
@@ -26,31 +28,32 @@ class MessageManager:
         except Exception as e:
             print(f"Ошибка сохранения сообщений: {e}")
     
-    def add_processed_message(self, chat_id: int, message_id: str, content: str, 
+    async def add_processed_message(self, chat_id: int, message_id: str, content: str, 
                             timestamp: datetime, sent_to_telegram: bool = False) -> bool:
-        """Добавление проверенного сообщения"""
-        try:
-            key = f"{chat_id}_{message_id}"
-            
-            # Проверяем, не обработано ли уже это сообщение
-            if key in self.processed_messages:
+        """Добавление проверенного сообщения (атомарная операция)"""
+        async with self._lock:
+            try:
+                key = f"{chat_id}_{message_id}"
+                
+                # Проверяем, не обработано ли уже это сообщение
+                if key in self.processed_messages:
+                    return False
+                
+                self.processed_messages[key] = {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "timestamp": timestamp.isoformat(),
+                    "sent_to_telegram": sent_to_telegram,
+                    "processed_at": datetime.now().isoformat()
+                }
+                
+                self.save_messages()
+                return True
+                
+            except Exception as e:
+                print(f"Ошибка добавления сообщения: {e}")
                 return False
-            
-            self.processed_messages[key] = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "content": content,
-                "timestamp": timestamp.isoformat(),
-                "sent_to_telegram": sent_to_telegram,
-                "processed_at": datetime.now().isoformat()
-            }
-            
-            self.save_messages()
-            return True
-            
-        except Exception as e:
-            print(f"Ошибка добавления сообщения: {e}")
-            return False
     
     def is_message_processed(self, chat_id: int, message_id: str) -> bool:
         """Проверка, обработано ли сообщение"""

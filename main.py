@@ -9,6 +9,38 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
 from bot_service import BotService
+from auto_updater import check_and_update, restart_bot, get_current_version
+
+# Интервал принудительного рестарта (1 час = 3600 секунд)
+HARD_RESTART_INTERVAL = 3600
+# Интервал проверки обновлений (2 часа)
+UPDATE_CHECK_INTERVAL = 7200
+
+async def hard_restart_scheduler():
+    """Принудительный рестарт через час для очистки памяти и pm2"""
+    await asyncio.sleep(HARD_RESTART_INTERVAL)
+    logging.info(f"⚡ Принудительный рестарт через {HARD_RESTART_INTERVAL}с - pm2 поднимет бота")
+    os._exit(1)  # Жесткий выход, pm2 перезапустит
+
+
+async def update_checker(auto_update_enabled: bool):
+    """Периодическая проверка обновлений каждые 2 часа"""
+    while True:
+        await asyncio.sleep(UPDATE_CHECK_INTERVAL)
+        
+        if not auto_update_enabled:
+            continue
+        
+        try:
+            logging.info("🔄 Периодическая проверка обновлений...")
+            needs_restart, message = await check_and_update(auto_update_enabled)
+            logging.info(f"📦 {message}")
+            
+            if needs_restart:
+                logging.info("🔄 Перезапуск для применения обновления...")
+                restart_bot()
+        except Exception as e:
+            logging.error(f"Ошибка проверки обновлений: {e}")
 
 def setup_logging():
     """Настройка логирования"""
@@ -32,6 +64,20 @@ async def main():
     try:
         # Загружаем конфигурацию
         config = Config.from_env()
+        
+        # Проверяем обновления при запуске
+        logging.info(f"🤖 GGSel Bot v{get_current_version()}")
+        
+        if config.auto_update:
+            logging.info("🔄 Проверка обновлений...")
+            needs_restart, message = await check_and_update(config.auto_update)
+            logging.info(f"📦 {message}")
+            
+            if needs_restart:
+                logging.info("🔄 Перезапуск для применения обновления...")
+                restart_bot()
+        else:
+            logging.info("⏸️ Автообновление отключено")
         
         # Проверяем обязательные параметры
         if not config.ggsel_api_key:
@@ -61,6 +107,13 @@ async def main():
         
         # Запускаем бота
         try:
+            # Запускаем таймер принудительного рестарта
+            asyncio.create_task(hard_restart_scheduler())
+            logging.info(f"⏰ Запланирован рестарт через {HARD_RESTART_INTERVAL}с")
+            
+            # Запускаем периодическую проверку обновлений
+            asyncio.create_task(update_checker(config.auto_update))
+            
             await bot_service.start()
         except KeyboardInterrupt:
             logging.info("Получен KeyboardInterrupt")
