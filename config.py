@@ -36,6 +36,9 @@ class Config:
     max_retries: int = 3  # максимальное количество повторных попыток
     retry_delay: int = 5  # задержка между попытками в секундах
     
+    # Автообновление
+    auto_update: bool = True  # автоматическое обновление с GitHub
+    
     @classmethod
     def from_env(cls) -> 'Config':
         return cls(
@@ -48,5 +51,6 @@ class Config:
             chat_check_interval=int(os.getenv('CHAT_CHECK_INTERVAL', '40')),
             telegram_timeout=int(os.getenv('TELEGRAM_TIMEOUT', '30')),
             max_retries=int(os.getenv('MAX_RETRIES', '3')),
-            retry_delay=int(os.getenv('RETRY_DELAY', '5'))
+            retry_delay=int(os.getenv('RETRY_DELAY', '5')),
+            auto_update=os.getenv('AUTO_UPDATE', 'true').lower() in ('true', '1', 'yes')
         )

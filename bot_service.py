@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from telegram import InlineKeyboardButton
@@ -14,13 +15,18 @@ from message_manager import MessageManager
 from purchase_manager import PurchaseManager, Purchase
 from autoresponder import AutoResponder
 
+# Глобальный пул потоков для параллельных HTTP запросов
+_executor = ThreadPoolExecutor(max_workers=20)
+
 class BotService:
     def __init__(self, config: Config):
         self.config = config
         self.database = Database(config.database_path)
         self.ggsel_api = GGSelAPI(config)
         self.telegram_bot = TelegramBot(config)
-        self.topic_manager = TopicManager()
+        # Используем абсолютный путь для topics.json
+        topics_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "topics.json")
+        self.topic_manager = TopicManager(topics_file)
         self.message_manager = MessageManager()
         self.purchase_manager = PurchaseManager()
         self.autoresponder = AutoResponder()
@@ -38,9 +44,7 @@ class BotService:
         self.processed_reviews_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_reviews.json")
         self.failed_topics = {}  # {invoice_id: timestamp} - неудачные попытки создания топиков
         self.api_error_until = None  # Кулдаун при ошибках API/сети
-        
-        # Hot/Cold система - последние 25 топиков горячие
-        self.hot_topics_max = 25
+        self.chat_locks = {}  # Блокировки для каждого чата
         
         self._load_pending_topics()
         self._load_processed_reviews()
@@ -151,8 +155,10 @@ class BotService:
             logging.error("Ошибка авторизации GGSel API")
             return
         
+        # Проверка API отзывов при запуске
+        await self.test_reviews_api()
+        
         await self.process_pending_topics()
-        await self.link_existing_topics_with_chats()
         
         logging.info("Бот запущен")
         self.running = True
@@ -169,6 +175,27 @@ class BotService:
             pass
         finally:
             await self.stop()
+    
+    async def test_reviews_api(self):
+        """Тест API отзывов при запуске"""
+        try:
+            loop = asyncio.get_event_loop()
+            reviews_data = await loop.run_in_executor(
+                _executor, lambda: self.ggsel_api.get_reviews(5)
+            )
+            
+            if not reviews_data:
+                logging.warning("API отзывов: нет данных")
+                return
+            
+            reviews = reviews_data.get('reviews', [])
+            logging.info(f"API отзывов: получено {len(reviews)} отзывов")
+            
+            if reviews:
+                r = reviews[0]
+                logging.info(f"Пример отзыва: id={r.get('id')}, invoice_id={r.get('invoice_id')}, good={r.get('good')}")
+        except Exception as e:
+            logging.error(f"Ошибка теста API отзывов: {e}")
     
     def handle_topic_message(self, topic_id: int, message_text: str, username: str, message_id: int):
         """Обработка сообщения в топике"""
@@ -332,7 +359,7 @@ class BotService:
                 return
             self.flood_control_until = None
             
-            # Проверяем по invoice_id, не по email (мультизаказность)
+            # Проверяем по invoice_id
             topic_key = f"purchase_{purchase.invoice_id}"
             if self.topic_manager.get_all_topics().get(topic_key):
                 return
@@ -348,8 +375,8 @@ class BotService:
             topic_id, cooldown = await self.telegram_bot.create_topic(topic_name)
             
             if topic_id is not None:
-                chat_ids = await self.find_chats_for_customer(customer_id)
-                self.topic_manager.add_topic_for_purchase(purchase, topic_id, topic_name, chat_ids)
+                # Используем invoice_id как id_i чата (без поиска по email)
+                self.topic_manager.add_topic_for_purchase(purchase, topic_id, topic_name)
                 
                 # Форматирование даты
                 date_str = ""
@@ -377,8 +404,6 @@ class BotService:
                 if options_text:
                     msg += f"\n⚙️ Опции:\n{options_text}\n"
                 
-                msg += f"\n{'✅ Чатов: ' + str(len(chat_ids)) if chat_ids else '⚠️ Чаты не найдены'}"
-                
                 await self.send_message_with_cooldown(msg, topic_id)
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
                 
@@ -387,7 +412,6 @@ class BotService:
                     await self.process_csv_rules(purchase.invoice_id, topic_id, options_list)
                 
                 # Отправляем приветствие в чат покупки (invoice_id = id_i чата)
-                # НЕ отправляем при пересоздании топика (skip_greeting=True)
                 if not skip_greeting and self.autoresponder.should_send_first_message():
                     greeting = self.autoresponder.get_first_message_text()
                     if greeting:
@@ -397,7 +421,6 @@ class BotService:
                                 None, 
                                 lambda cid=purchase.invoice_id, g=greeting: self.ggsel_api.send_message(cid, g)
                             )
-                            # И в топик
                             await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
                             logging.info(f"Приветствие отправлено в чат {purchase.invoice_id}")
                         except Exception as e:
@@ -409,7 +432,6 @@ class BotService:
                 self._save_pending_topics()
                 logging.warning(f"Flood control {cooldown}s, в очередь: {purchase.invoice_id}")
             else:
-                # Ошибка создания - запоминаем время неудачи, повторим через 5 минут
                 self.failed_topics[purchase.invoice_id] = datetime.now()
                 logging.error(f"Не удалось создать топик для {purchase.invoice_id}, повтор через 5 мин")
                 
@@ -417,7 +439,7 @@ class BotService:
             self.failed_topics[purchase.invoice_id] = datetime.now()
             logging.error(f"Ошибка создания топика покупки {purchase.invoice_id}: {e}")
     
-    async def load_chat_history(self, chat_ids: List[int], topic_id: int):
+    async def load_chat_history(self, chat_ids: List[int], topic_id: int, force_reload: bool = False):
         """Загрузка истории сообщений из GGSel и отправка в топик"""
         try:
             all_messages = []
@@ -480,15 +502,17 @@ class BotService:
                 if not content:
                     continue
                 
-                # Проверяем, не обработано ли уже
-                if self.message_manager.is_message_processed(chat_id, message_id):
+                # Проверяем, не обработано ли уже (кроме случая force_reload)
+                if not force_reload and self.message_manager.is_message_processed(chat_id, message_id):
                     continue
                 
-                # Просто текст сообщения
-                await self.send_message_with_cooldown(content, topic_id, chat_id, message_id)
+                # Просто текст сообщения с пометкой истории при force_reload
+                message_text = f"📜 {content}" if force_reload else content
+                await self.send_message_with_cooldown(message_text, topic_id, chat_id, message_id)
                 
-                # Помечаем как обработанное
-                self.message_manager.add_processed_message(chat_id, message_id, content, timestamp)
+                # Помечаем как обработанное (только если не force_reload)
+                if not force_reload:
+                    await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp)
                 
                 await asyncio.sleep(0.5)
                 
@@ -538,15 +562,16 @@ class BotService:
         await self.process_pending_history_loads()
     
     async def monitor_messages(self):
-        """Мониторинг сообщений с hot/cold системой и параллельной проверкой"""
+        """Мониторинг сообщений - проверяет все топики каждый цикл"""
         logging.info("Запуск мониторинга сообщений")
-        cold_counter = 0
         sync_counter = 0
-        unlinked_counter = 0
         review_counter = 0
         
         # Синхронизация в фоне, не блокируем основной цикл
         asyncio.create_task(self.sync_topics_with_purchases())
+        
+        # Проверяем отзывы сразу при запуске
+        asyncio.create_task(self.check_new_reviews())
         
         while self.running:
             try:
@@ -557,40 +582,16 @@ class BotService:
                     await asyncio.sleep(2)
                     continue
                 
+                # Получаем все топики покупок и проверяем их
                 all_topics = self.topic_manager.get_all_topics()
                 purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
                 
-                # Сортируем по invoice_id (новые = больший ID)
-                sorted_keys = sorted(purchase_topics.keys(), 
-                                    key=lambda k: purchase_topics[k].get('invoice_id', 0), 
-                                    reverse=True)
+                if purchase_topics:
+                    await self.check_topics_parallel(purchase_topics)
                 
-                # Hot = последние 25, Cold = остальные
-                hot_keys = sorted_keys[:self.hot_topics_max]
-                cold_keys = sorted_keys[self.hot_topics_max:]
-                
-                # Горячие топики - каждый цикл (2 сек)
-                hot_topics = {k: v for k, v in purchase_topics.items() if k in hot_keys}
-                if hot_topics:
-                    await self.check_topics_parallel(hot_topics)
-                
-                # Холодные топики - каждые 30 циклов (~1 минута)
-                cold_counter += 1
-                if cold_counter >= 30 and cold_keys:
-                    cold_counter = 0
-                    cold_topics = {k: v for k, v in purchase_topics.items() if k in cold_keys}
-                    if cold_topics:
-                        asyncio.create_task(self.check_topics_parallel(cold_topics))
-                
-                # Проверяем новые чаты без топиков каждые 30 циклов (~1 минута)
-                unlinked_counter += 1
-                if unlinked_counter >= 30:
-                    unlinked_counter = 0
-                    asyncio.create_task(self.check_unlinked_chats())
-                
-                # Проверяем отзывы каждые 60 циклов (~2 минуты)
+                # Проверяем отзывы каждые 10 циклов (~20 секунд)
                 review_counter += 1
-                if review_counter >= 60:
+                if review_counter >= 10:
                     review_counter = 0
                     asyncio.create_task(self.check_new_reviews())
                 
@@ -606,39 +607,46 @@ class BotService:
             await asyncio.sleep(2)  # 2 секунды между циклами
     
     async def check_topics_parallel(self, topics: Dict):
-        """Параллельная проверка топиков"""
-        tasks = []
+        """Параллельная проверка топиков с семафором"""
+        if not topics:
+            return
         
+        # Семафор для ограничения параллельных запросов (10 одновременно)
+        semaphore = asyncio.Semaphore(10)
+        
+        async def check_with_semaphore(invoice_id: int, topic_id: int):
+            async with semaphore:
+                await self._check_single_chat(invoice_id, topic_id)
+        
+        tasks = []
         for topic_key, topic_info in topics.items():
-            chat_ids = topic_info.get('chat_ids', [])
             topic_id = topic_info.get('topic_id')
             invoice_id = topic_info.get('invoice_id')
             
-            if topic_id:
-                # Если chat_ids пустой, используем invoice_id как chat_id
-                if not chat_ids and invoice_id:
-                    chat_ids = [invoice_id]
-                
-                for chat_id in chat_ids:
-                    tasks.append(self._check_single_chat(chat_id, topic_id))
+            if topic_id and invoice_id:
+                tasks.append(check_with_semaphore(invoice_id, topic_id))
         
         if tasks:
-            # Все запросы параллельно (GGSel API не имеет документированного rate limit)
             await asyncio.gather(*tasks, return_exceptions=True)
     
     async def _check_single_chat(self, chat_id: int, topic_id: int):
-        """Проверка одного чата"""
-        try:
-            await self.check_chat_messages(chat_id, topic_id)
-        except Exception as e:
-            logging.error(f"Ошибка проверки чата {chat_id}: {e}")
+        """Проверка одного чата с блокировкой от дублирования"""
+        # Получаем или создаем блокировку для этого чата
+        if chat_id not in self.chat_locks:
+            self.chat_locks[chat_id] = asyncio.Lock()
+        
+        async with self.chat_locks[chat_id]:
+            try:
+                await self.check_chat_messages(chat_id, topic_id)
+            except Exception as e:
+                logging.error(f"Ошибка проверки чата {chat_id}: {e}")
     
     async def check_chat_messages(self, chat_id: int, topic_id: int) -> bool:
         """Проверка сообщений чата. Возвращает True если было новое сообщение"""
         try:
             loop = asyncio.get_event_loop()
             messages_data = await loop.run_in_executor(
-                None, self.ggsel_api.get_chat_messages, chat_id
+                _executor, self.ggsel_api.get_chat_messages, chat_id
             )
             
             if not messages_data:
@@ -665,8 +673,8 @@ class BotService:
             if not message_id or not content:
                 return False
             
-            # Проверяем по глобальному message_id (без chat_id) чтобы избежать дублей
-            if self.message_manager.is_message_processed(0, message_id):
+            # Проверяем по уникальному ключу chat_id + message_id
+            if self.message_manager.is_message_processed(chat_id, message_id):
                 return False
             
             try:
@@ -674,8 +682,8 @@ class BotService:
             except:
                 timestamp = datetime.now()
             
-            # Сохраняем с chat_id=0 для глобальной уникальности
-            if self.message_manager.add_processed_message(0, message_id, content, timestamp):
+            # Сохраняем с правильным chat_id для уникальности
+            if await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp):
                 message = Message(chat_id=chat_id, message_id=message_id, content=content, timestamp=timestamp)
                 self.database.save_message(message)
                 
@@ -743,8 +751,17 @@ class BotService:
         logging.info("Бот остановлен")
     
     async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None) -> bool:
-        """Отправка с учетом кулдауна"""
+        """Отправка с учетом кулдауна и проверкой дублей"""
         try:
+            # Проверяем, не было ли это сообщение уже отправлено в Telegram
+            if chat_id and message_id:
+                key = f"{chat_id}_{message_id}"
+                if key in self.message_manager.processed_messages:
+                    msg_data = self.message_manager.processed_messages[key]
+                    if msg_data.get("sent_to_telegram", False):
+                        logging.debug(f"Сообщение {message_id} уже отправлено в Telegram, пропускаем")
+                        return True
+            
             if self.message_flood_control_until and datetime.now() < self.message_flood_control_until:
                 self.pending_messages.append({
                     'text': text, 'topic_id': topic_id,
@@ -794,91 +811,6 @@ class BotService:
             if not success and self.message_flood_control_until:
                 break
             await asyncio.sleep(1)
-    
-    async def find_chats_for_customer(self, customer_id: str) -> List[int]:
-        """Поиск чатов по email"""
-        try:
-            matching = []
-            loop = asyncio.get_event_loop()
-            
-            chats_data = await loop.run_in_executor(
-                None, lambda: self.ggsel_api.get_chats_by_email(customer_id, 100, 1)
-            )
-            
-            if chats_data:
-                chats = self.ggsel_api.parse_chats_response(chats_data)
-                customer_lower = customer_id.lower()
-                for chat in chats:
-                    if chat.email and chat.email.lower() == customer_lower and chat.id_i:
-                        if chat.id_i not in matching:
-                            matching.append(chat.id_i)
-                
-                if matching:
-                    return matching
-            
-            page = 1
-            while page <= 100:
-                chats_data = await loop.run_in_executor(
-                    None, lambda p=page: self.ggsel_api.get_chats(pagesize=100, page=p)
-                )
-                
-                if not chats_data:
-                    break
-                
-                chats = self.ggsel_api.parse_chats_response(chats_data)
-                if not chats:
-                    break
-                
-                customer_lower = customer_id.lower()
-                for chat in chats:
-                    if chat.email and chat.email.lower() == customer_lower and chat.id_i:
-                        if chat.id_i not in matching:
-                            matching.append(chat.id_i)
-                
-                if matching:
-                    break
-                
-                if page >= chats_data.get('cnt_pages', 1):
-                    break
-                
-                page += 1
-                await asyncio.sleep(0.3)
-            
-            return matching
-            
-        except Exception as e:
-            logging.error(f"Ошибка поиска чатов: {e}")
-            return []
-    
-    async def link_existing_topics_with_chats(self):
-        """Связывание топиков с чатами"""
-        try:
-            all_topics = self.topic_manager.get_all_topics()
-            purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
-            
-            if not purchase_topics:
-                return
-            
-            unlinked = [(k, v) for k, v in purchase_topics.items() if not v.get('chat_ids')]
-            
-            if not unlinked:
-                return
-            
-            logging.info(f"Связываем {len(unlinked)} топиков...")
-            
-            linked = 0
-            for key, info in unlinked:
-                email = info.get('email')
-                if email:
-                    chat_ids = await self.find_chats_for_customer(email)
-                    if chat_ids:
-                        self.topic_manager.update_topic_chat_ids(key, chat_ids)
-                        linked += 1
-            
-            logging.info(f"Связано {linked} топиков")
-            
-        except Exception as e:
-            logging.error(f"Ошибка связывания: {e}")
     
     async def reauth_scheduler(self):
         """Переавторизация каждые 15 минут"""
@@ -1710,12 +1642,15 @@ class BotService:
         return False
 
     async def sync_topics_with_purchases(self):
-        """Синхронизация топиков с покупками - только создание новых топиков"""
+        """Синхронизация топиков с покупками - проверка удалённых и создание новых"""
         logging.info("Запуск синхронизации топиков с покупками...")
         
         if not await self.ensure_ggsel_auth():
             logging.error("Синхронизация: ошибка авторизации")
             return
+        
+        # Сначала проверяем удалённые топики
+        await self.check_deleted_topics()
         
         # Получаем последние покупки
         loop = asyncio.get_event_loop()
@@ -1774,112 +1709,69 @@ class BotService:
         if created_count > 0:
             logging.info(f"Синхронизация: создано {created_count} топиков")
     
-    async def ensure_topic_for_chat(self, chat_id: int, email: str) -> Optional[int]:
-        """Убедиться что топик существует для чата, создать если нет"""
-        # Ищем топик по email
+    async def check_deleted_topics(self):
+        """Проверка и пересоздание удалённых топиков"""
         all_topics = self.topic_manager.get_all_topics()
+        purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
         
-        for key, info in all_topics.items():
-            if chat_id in info.get('chat_ids', []):
-                return info.get('topic_id')
+        if not purchase_topics:
+            return
         
-        # Топик не найден - ищем покупку по email и создаём
-        loop = asyncio.get_event_loop()
+        deleted_count = 0
+        recreated_count = 0
         
-        # Получаем последние покупки и ищем по email
-        sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 50)
-        
-        if not sales_data or sales_data.get('retval') != 0:
-            return None
-        
-        for sale in sales_data.get('sales', []):
-            invoice_id = sale.get('invoice_id')
-            if not invoice_id:
+        for topic_key, topic_info in list(purchase_topics.items()):
+            topic_id = topic_info.get('topic_id')
+            topic_name = topic_info.get('topic_name', '💬')
+            invoice_id = topic_info.get('invoice_id')
+            
+            if not topic_id or not topic_name:
                 continue
             
-            # Получаем инфо о покупке
-            purchase_data = await loop.run_in_executor(
-                None, self.ggsel_api.get_purchase_info, invoice_id
-            )
+            # Проверяем существует ли топик (ставим то же название)
+            exists = await self.telegram_bot.check_topic_exists(topic_id, topic_name)
             
-            if not purchase_data:
-                continue
+            if not exists:
+                deleted_count += 1
+                logging.info(f"Топик {topic_id} (invoice {invoice_id}) удалён, пересоздаём...")
+                
+                # Удаляем из базы
+                self.topic_manager.remove_topic(topic_key)
+                
+                # Пересоздаём топик
+                if invoice_id:
+                    loop = asyncio.get_event_loop()
+                    purchase_data = await loop.run_in_executor(
+                        None, self.ggsel_api.get_purchase_info, invoice_id
+                    )
+                    
+                    if purchase_data:
+                        purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
+                        if purchase:
+                            await self.create_topic_for_purchase(purchase, skip_greeting=True)
+                            recreated_count += 1
+                            
+                            if self.flood_control_until:
+                                break
+                            
+                            await asyncio.sleep(3)
             
-            buyer_email = purchase_data.get('buyer_email', '')
-            if buyer_email and buyer_email.lower() == email.lower():
-                # Нашли покупку - создаём топик если его нет
-                topic_key = f"purchase_{invoice_id}"
-                if topic_key not in all_topics:
-                    purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
-                    if purchase:
-                        self.purchase_manager.add_purchase(purchase)
-                        await self.create_topic_for_purchase(purchase)
-                        
-                        # Возвращаем topic_id
-                        updated_topics = self.topic_manager.get_all_topics()
-                        if topic_key in updated_topics:
-                            return updated_topics[topic_key].get('topic_id')
-                break
+            await asyncio.sleep(0.5)  # Небольшая задержка между проверками
         
-        return None
-
-    async def check_unlinked_chats(self):
-        """Проверка чатов без топиков - создание топиков при новых сообщениях"""
-        try:
-            loop = asyncio.get_event_loop()
-            
-            # Получаем последние чаты
-            chats_data = await loop.run_in_executor(
-                None, lambda: self.ggsel_api.get_chats(pagesize=20, page=1)
-            )
-            
-            if not chats_data:
-                return
-            
-            chats = self.ggsel_api.parse_chats_response(chats_data)
-            if not chats:
-                return
-            
-            # Получаем все chat_ids из существующих топиков
-            all_topics = self.topic_manager.get_all_topics()
-            linked_chat_ids = set()
-            for info in all_topics.values():
-                for cid in info.get('chat_ids', []):
-                    linked_chat_ids.add(cid)
-            
-            # Проверяем чаты без топиков
-            for chat in chats:
-                if not chat.id_i or chat.id_i in linked_chat_ids:
-                    continue
-                
-                # Чат без топика - проверяем есть ли новые сообщения
-                messages_data = await loop.run_in_executor(
-                    None, self.ggsel_api.get_chat_messages, chat.id_i
-                )
-                
-                if not messages_data:
-                    continue
-                
-                # Есть сообщения - ищем покупку и создаём топик
-                if chat.email:
-                    topic_id = await self.ensure_topic_for_chat(chat.id_i, chat.email)
-                    if topic_id:
-                        logging.info(f"Создан топик для чата {chat.id_i}")
-                        await asyncio.sleep(2)
-                        
-        except Exception as e:
-            logging.error(f"Ошибка проверки чатов: {e}")
-
+        if deleted_count > 0:
+            logging.info(f"Найдено удалённых: {deleted_count}, пересоздано: {recreated_count}")
+    
     async def check_new_reviews(self):
         """Проверка новых отзывов и отправка уведомлений в топики"""
         try:
             loop = asyncio.get_event_loop()
             
             reviews_data = await loop.run_in_executor(
-                None, lambda: self.ggsel_api.get_reviews(50)
+                _executor, lambda: self.ggsel_api.get_reviews(100)
             )
             
             if not reviews_data:
+                logging.warning("API отзывов: нет данных")
                 return
             
             reviews = reviews_data.get('reviews', [])
@@ -1888,36 +1780,45 @@ class BotService:
             
             all_topics = self.topic_manager.get_all_topics()
             
+            # Создаём маппинг invoice_id -> topic_info для быстрого поиска
+            invoice_to_topic = {}
+            for key, topic_info in all_topics.items():
+                if key.startswith('purchase_'):
+                    inv_id = topic_info.get('invoice_id')
+                    if inv_id:
+                        invoice_to_topic[int(inv_id)] = topic_info
+            
+            new_reviews_count = 0
+            
             for review in reviews:
-                # Получаем ID отзыва
                 review_id = str(review.get('id', ''))
                 if not review_id:
                     continue
                 
-                # Создаём хэш содержимого (тип + текст)
+                # Тип отзыва
                 review_type = review.get('type', 'good')
-                info = review.get('info', '')
+                
+                # Текст отзыва
+                info = review.get('info', '') or ''
                 review_hash = f"{review_type}:{info}"
                 
                 # Проверяем изменился ли отзыв
                 old_hash = self.processed_reviews.get(review_id)
                 if old_hash == review_hash:
-                    continue  # Отзыв не изменился
+                    continue
                 
-                is_updated = old_hash is not None  # Был ли отзыв раньше
+                is_updated = old_hash is not None
                 
-                # Сохраняем новый хэш
+                # Сохраняем хэш
                 self.processed_reviews[review_id] = review_hash
                 self._save_processed_reviews()
                 
-                # Ищем топик по invoice_id
+                # Ищем топик
                 invoice_id = review.get('invoice_id')
                 if not invoice_id:
                     continue
                 
-                topic_key = f"purchase_{invoice_id}"
-                topic_info = all_topics.get(topic_key)
-                
+                topic_info = invoice_to_topic.get(int(invoice_id))
                 if not topic_info:
                     continue
                 
@@ -1925,35 +1826,39 @@ class BotService:
                 if not topic_id:
                     continue
                 
-                # Формируем сообщение об отзыве
+                # Формируем сообщение
                 name = review.get('name', '')
                 date = review.get('date', '')
                 
                 emoji = "👍" if review_type == 'good' else "👎"
                 prefix = "✏️ Отзыв изменён!" if is_updated else f"{emoji} Новый отзыв!"
-                msg = f"{prefix}\n\n"
+                
+                msg = f"{prefix}\n"
                 if name:
                     msg += f"📦 {name}\n"
-                if info:
-                    msg += f"💬 {info}\n"
                 if date:
-                    msg += f"📅 {date}"
+                    msg += f"📅 {date}\n"
+                if info:
+                    msg += f"\n💬 {info}"
                 
                 await self.send_message_with_cooldown(msg, topic_id)
-                logging.info(f"Отзыв для invoice {invoice_id} отправлен в топик {topic_id}")
+                new_reviews_count += 1
+                logging.info(f"Отзыв {review_id} отправлен в топик {topic_id} (invoice {invoice_id})")
                 
-                # Автоответ на отзыв юзеру
+                # Автоответ
                 auto_response = self.autoresponder.get_review_response(review_type)
                 if auto_response:
                     try:
                         await loop.run_in_executor(
-                            None,
-                            lambda cid=invoice_id, txt=auto_response: self.ggsel_api.send_message(cid, txt)
+                            _executor,
+                            lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt)
                         )
                         await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id)
-                        logging.info(f"Автоответ на отзыв отправлен в чат {invoice_id}")
                     except Exception as e:
-                        logging.error(f"Ошибка отправки автоответа на отзыв: {e}")
+                        logging.error(f"Ошибка автоответа на отзыв: {e}")
+            
+            if new_reviews_count > 0:
+                logging.info(f"Обработано {new_reviews_count} новых отзывов")
                 
         except Exception as e:
             logging.error(f"Ошибка проверки отзывов: {e}")
@@ -1991,32 +1896,21 @@ class BotService:
                 await self.telegram_bot.send_message("❌ Топик не найден в базе", topic_id)
                 return
             
-            chat_ids = target_topic.get('chat_ids', [])
-            
-            if not chat_ids:
-                # Пробуем найти чаты по email
-                email = target_topic.get('email')
-                if email:
-                    chat_ids = await self.find_chats_for_customer(email)
-                    if chat_ids:
-                        # Обновляем топик
-                        for key, info in all_topics.items():
-                            if info.get('topic_id') == topic_id:
-                                self.topic_manager.update_topic_chat_ids(key, chat_ids)
-                                break
-            
-            if not chat_ids:
-                await self.telegram_bot.send_message("❌ Нет связанных чатов", topic_id)
+            invoice_id = target_topic.get('invoice_id')
+            if not invoice_id:
+                await self.telegram_bot.send_message("❌ Нет invoice_id", topic_id)
                 return
             
-            # Сбрасываем обработанные сообщения для этих чатов чтобы загрузить заново
-            for chat_id in chat_ids:
-                if chat_id in self.message_manager.processed_messages:
-                    del self.message_manager.processed_messages[chat_id]
+            # НЕ удаляем обработанные сообщения, а добавляем флаг переотправки
+            await self.telegram_bot.send_message("🔄 Загружаю историю...", topic_id)
             
-            # Загружаем историю
-            await self.load_chat_history(chat_ids, topic_id)
+            # Загружаем историю с флагом force_reload=True
+            await self.load_chat_history([invoice_id], topic_id, force_reload=True)
             await self.telegram_bot.send_message("✅ История загружена", topic_id)
+            
+        except Exception as e:
+            logging.error(f"Ошибка загрузки истории: {e}")
+            await self.telegram_bot.send_message(f"❌ Ошибка: {e}", topic_id)
             
         except Exception as e:
             logging.error(f"Ошибка загрузки истории: {e}")
