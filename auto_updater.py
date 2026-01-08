@@ -11,7 +11,7 @@ import aiohttp
 from typing import Optional, Tuple
 
 # URL для проверки версии и скачивания
-VERSION_URL = "https://raw.githubusercontent.com/voterol/ggsel_seller_helper/refs/heads/main/__init__.py"
+VERSION_URL = "https://raw.githubusercontent.com/voterol/ggsel_seller_helper/main/__init__.py"
 REPO_ZIP_URL = "https://github.com/voterol/ggsel_seller_helper/archive/refs/heads/main.zip"
 
 # Текущая директория бота
@@ -95,21 +95,38 @@ async def download_and_extract_update() -> bool:
             
             logging.info("Обновление файлов...")
             
-            # Копируем только .py файлы
+            # Файлы которые НЕ нужно перезаписывать
+            skip_files = {
+                '.env',
+                '.env.example',
+                'readme.md',
+                'README.md',
+                'topics.json',
+                'processed_reviews.json',
+                'processed_purchases.json',
+                'processed_messages.json',
+                'pending_topics.json',
+                'autoresponder.json',
+                'ggsel_bot.db'
+            }
+            
+            # Копируем все файлы кроме исключённых
             for item in os.listdir(source_dir):
-                # Только .py файлы
-                if not item.endswith('.py'):
+                if item in skip_files or item.lower() in skip_files:
                     continue
                 
                 src = os.path.join(source_dir, item)
                 dst = os.path.join(BOT_DIR, item)
                 
-                if not os.path.isfile(src):
-                    continue
-                
                 try:
-                    shutil.copy2(src, dst)
-                    logging.debug(f"Обновлён: {item}")
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+                        logging.debug(f"Обновлён: {item}")
+                    elif os.path.isdir(src):
+                        if os.path.exists(dst):
+                            shutil.rmtree(dst)
+                        shutil.copytree(src, dst)
+                        logging.debug(f"Обновлена папка: {item}")
                 except Exception as e:
                     logging.error(f"Ошибка копирования {item}: {e}")
             
