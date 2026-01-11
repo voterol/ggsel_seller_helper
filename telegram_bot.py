@@ -19,6 +19,7 @@ class TelegramBot:
         self.general_message_handler = None  # Обработчик сообщений в General
         self.history_handler = None  # Обработчик команды /history
         self.options_handler = None  # Обработчик команды /options
+        self.review_handler = None  # Обработчик команды /review
         
     async def start(self):
         """Запуск бота"""
@@ -41,6 +42,7 @@ class TelegramBot:
             self.application.add_handler(CommandHandler("auto", self._handle_auto_command))
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))
+            self.application.add_handler(CommandHandler("review", self._handle_review_command))
             
             # Callback для inline кнопок
             self.application.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -84,6 +86,9 @@ class TelegramBot:
     
     def set_options_handler(self, handler: Callable):
         self.options_handler = handler
+    
+    def set_review_handler(self, handler: Callable):
+        self.review_handler = handler
     
     async def _handle_menu_command(self, update: Update, context):
         """Команда /menu - главное меню"""
@@ -146,6 +151,22 @@ class TelegramBot:
         
         if self.options_handler:
             await self.options_handler(topic_id)
+    
+    async def _handle_review_command(self, update: Update, context):
+        """Команда /review - проверить отзыв"""
+        if update.effective_chat.id != self.group_id:
+            return
+        
+        topic_id = update.message.message_thread_id
+        if not topic_id:
+            try:
+                await update.message.reply_text("❌ Используйте команду в топике")
+            except:
+                pass
+            return
+        
+        if self.review_handler:
+            await self.review_handler(topic_id)
     
     async def _handle_callback(self, update: Update, context):
         """Обработка inline кнопок"""

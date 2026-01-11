@@ -279,3 +279,24 @@ class GGSelAPI:
                 except:
                     pass
             return None
+
+    def get_review_by_invoice(self, invoice_id: int) -> Optional[Dict[str, Any]]:
+        """Поиск отзыва по invoice_id
+        
+        Ищет отзыв в нескольких страницах результатов.
+        Возвращает отзыв или None если не найден.
+        """
+        for page in range(1, 20):  # Ищем в первых 20 страницах
+            data = self.get_reviews(count=50, page=page)
+            if not data:
+                break
+            
+            reviews = data.get('reviews', [])
+            if not reviews:
+                break
+            
+            for review in reviews:
+                if review.get('invoice_id') == invoice_id:
+                    return review
+        
+        return None

@@ -148,6 +148,7 @@ class BotService:
         self.telegram_bot.set_general_message_handler(self.handle_general_message)
         self.telegram_bot.set_history_handler(self.handle_history_command)
         self.telegram_bot.set_options_handler(self.handle_options_command)
+        self.telegram_bot.set_review_handler(self.handle_review_command)
         
         await self.telegram_bot.start()
         
@@ -193,7 +194,9 @@ class BotService:
             
             if reviews:
                 r = reviews[0]
-                logging.info(f"Пример отзыва: id={r.get('id')}, invoice_id={r.get('invoice_id')}, good={r.get('good')}")
+                # Показываем все ключи для диагностики
+                logging.info(f"Структура отзыва: {list(r.keys())}")
+                logging.info(f"Пример: id={r.get('id')}, invoice_id={r.get('invoice_id')}, good={r.get('good')}, type={r.get('type')}")
         except Exception as e:
             logging.error(f"Ошибка теста API отзывов: {e}")
     
@@ -589,9 +592,9 @@ class BotService:
                 if purchase_topics:
                     await self.check_topics_parallel(purchase_topics)
                 
-                # Проверяем отзывы каждые 10 циклов (~20 секунд)
+                # Проверяем отзывы каждые 3 цикла (~6 секунд)
                 review_counter += 1
-                if review_counter >= 10:
+                if review_counter >= 3:
                     review_counter = 0
                     asyncio.create_task(self.check_new_reviews())
                 
@@ -1762,25 +1765,12 @@ class BotService:
             logging.info(f"Найдено удалённых: {deleted_count}, пересоздано: {recreated_count}")
     
     async def check_new_reviews(self):
-        """Проверка новых отзывов и отправка уведомлений в топики"""
+        """Проверка новых отзывов - двойная проверка: общая по API + по invoice_id топиков"""
         try:
             loop = asyncio.get_event_loop()
-            
-            reviews_data = await loop.run_in_executor(
-                _executor, lambda: self.ggsel_api.get_reviews(100)
-            )
-            
-            if not reviews_data:
-                logging.warning("API отзывов: нет данных")
-                return
-            
-            reviews = reviews_data.get('reviews', [])
-            if not reviews:
-                return
-            
             all_topics = self.topic_manager.get_all_topics()
             
-            # Создаём маппинг invoice_id -> topic_info для быстрого поиска
+            # Создаём маппинг invoice_id -> topic_info
             invoice_to_topic = {}
             for key, topic_info in all_topics.items():
                 if key.startswith('purchase_'):
@@ -1788,80 +1778,145 @@ class BotService:
                     if inv_id:
                         invoice_to_topic[int(inv_id)] = topic_info
             
-            new_reviews_count = 0
-            
-            for review in reviews:
-                review_id = str(review.get('id', ''))
-                if not review_id:
-                    continue
-                
-                # Тип отзыва
-                review_type = review.get('type', 'good')
-                
-                # Текст отзыва
-                info = review.get('info', '') or ''
-                review_hash = f"{review_type}:{info}"
-                
-                # Проверяем изменился ли отзыв
-                old_hash = self.processed_reviews.get(review_id)
-                if old_hash == review_hash:
-                    continue
-                
-                is_updated = old_hash is not None
-                
-                # Сохраняем хэш
-                self.processed_reviews[review_id] = review_hash
-                self._save_processed_reviews()
-                
-                # Ищем топик
-                invoice_id = review.get('invoice_id')
-                if not invoice_id:
-                    continue
-                
-                topic_info = invoice_to_topic.get(int(invoice_id))
-                if not topic_info:
-                    continue
-                
-                topic_id = topic_info.get('topic_id')
-                if not topic_id:
-                    continue
-                
-                # Формируем сообщение
-                name = review.get('name', '')
-                date = review.get('date', '')
-                
-                emoji = "👍" if review_type == 'good' else "👎"
-                prefix = "✏️ Отзыв изменён!" if is_updated else f"{emoji} Новый отзыв!"
-                
-                msg = f"{prefix}\n"
-                if name:
-                    msg += f"📦 {name}\n"
-                if date:
-                    msg += f"📅 {date}\n"
-                if info:
-                    msg += f"\n💬 {info}"
-                
-                await self.send_message_with_cooldown(msg, topic_id)
-                new_reviews_count += 1
-                logging.info(f"Отзыв {review_id} отправлен в топик {topic_id} (invoice {invoice_id})")
-                
-                # Автоответ
-                auto_response = self.autoresponder.get_review_response(review_type)
-                if auto_response:
-                    try:
-                        await loop.run_in_executor(
-                            _executor,
-                            lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt)
-                        )
-                        await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id)
-                    except Exception as e:
-                        logging.error(f"Ошибка автоответа на отзыв: {e}")
-            
-            if new_reviews_count > 0:
-                logging.info(f"Обработано {new_reviews_count} новых отзывов")
+            # Запускаем обе проверки параллельно
+            await asyncio.gather(
+                self._check_reviews_by_api(loop, invoice_to_topic),
+                self._check_reviews_by_topics(loop, invoice_to_topic),
+                return_exceptions=True
+            )
                 
         except Exception as e:
             logging.error(f"Ошибка проверки отзывов: {e}")
+
+    async def _check_reviews_by_api(self, loop, invoice_to_topic: dict):
+        """Проверка отзывов через общий API (пагинация)"""
+        try:
+            all_reviews = []
+            max_known_id = max([int(rid) for rid in self.processed_reviews.keys()] or [0])
+            
+            for page in range(1, 6):
+                reviews_data = await loop.run_in_executor(
+                    _executor, lambda p=page: self.ggsel_api.get_reviews(50, page=p)
+                )
+                
+                if not reviews_data:
+                    break
+                
+                reviews = reviews_data.get('reviews', [])
+                if not reviews:
+                    break
+                
+                all_reviews.extend(reviews)
+                
+                page_ids = [int(r.get('id', 0)) for r in reviews if r.get('id')]
+                if page_ids and max(page_ids) <= max_known_id and all(str(rid) in self.processed_reviews for rid in page_ids):
+                    break
+                
+                await asyncio.sleep(0.3)
+            
+            if all_reviews:
+                all_reviews.sort(key=lambda r: int(r.get('id', 0)), reverse=True)
+                await self._process_reviews(all_reviews, invoice_to_topic, loop)
+                
+        except Exception as e:
+            logging.error(f"Ошибка проверки отзывов по API: {e}")
+
+    async def _check_reviews_by_topics(self, loop, invoice_to_topic: dict):
+        """Проверка отзывов по invoice_id каждого топика (параллельно)"""
+        try:
+            # Проверяем все топики что есть в базе
+            all_topics = list(invoice_to_topic.items())
+            
+            semaphore = asyncio.Semaphore(10)  # Максимум 10 параллельных запросов
+            
+            async def check_single_invoice(invoice_id: int, topic_info: dict):
+                async with semaphore:
+                    try:
+                        review = await loop.run_in_executor(
+                            _executor, lambda inv=invoice_id: self.ggsel_api.get_review_by_invoice(inv)
+                        )
+                        if review:
+                            await self._process_reviews([review], {invoice_id: topic_info}, loop)
+                    except Exception as e:
+                        logging.debug(f"Ошибка проверки отзыва для {invoice_id}: {e}")
+            
+            tasks = [check_single_invoice(inv_id, info) for inv_id, info in all_topics]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        except Exception as e:
+            logging.error(f"Ошибка проверки отзывов по топикам: {e}")
+
+    async def _process_reviews(self, reviews: list, invoice_to_topic: dict, loop):
+        """Обработка списка отзывов"""
+        new_reviews_count = 0
+        
+        for review in reviews:
+            review_id = str(review.get('id', ''))
+            if not review_id:
+                continue
+            
+            review_type = review.get('type', 'good')
+            info = review.get('info', '') or review.get('text', '') or ''
+            review_hash = f"{review_type}:{info}"
+            
+            old_hash = self.processed_reviews.get(review_id)
+            if old_hash == review_hash:
+                continue
+            
+            is_updated = old_hash is not None
+            
+            self.processed_reviews[review_id] = review_hash
+            self._save_processed_reviews()
+            
+            invoice_id = review.get('invoice_id')
+            if not invoice_id:
+                continue
+            
+            topic_info = invoice_to_topic.get(int(invoice_id))
+            if not topic_info:
+                continue
+            
+            topic_id = topic_info.get('topic_id')
+            if not topic_id:
+                continue
+            
+            name = review.get('name', '')
+            date = review.get('date', '')
+            
+            emoji = "👍" if review_type == 'good' else "👎"
+            type_text = "Положительный" if review_type == 'good' else "Отрицательный"
+            
+            if is_updated:
+                prefix = f"✏️ Отзыв изменён! {emoji}"
+            else:
+                prefix = f"{emoji} Новый отзыв!"
+            
+            msg = f"{prefix}\n"
+            msg += f"📊 Тип: {type_text}\n"
+            if name:
+                msg += f"📦 {name}\n"
+            if date:
+                msg += f"📅 {date}\n"
+            if info:
+                msg += f"\n💬 {info}"
+            
+            await self.send_message_with_cooldown(msg, topic_id)
+            new_reviews_count += 1
+            logging.info(f"Отзыв {review_id} ({review_type}) -> топик {topic_id} (invoice {invoice_id})")
+            
+            auto_response = self.autoresponder.get_review_response(review_type)
+            if auto_response:
+                try:
+                    await loop.run_in_executor(
+                        _executor,
+                        lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt)
+                    )
+                    await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id)
+                except Exception as e:
+                    logging.error(f"Ошибка автоответа на отзыв: {e}")
+        
+        if new_reviews_count > 0:
+            logging.info(f"Обработано {new_reviews_count} новых отзывов")
 
     async def process_pending_history_loads(self):
         """Загрузка истории сообщений для созданных топиков"""
@@ -2029,4 +2084,55 @@ class BotService:
             
         except Exception as e:
             logging.error(f"Ошибка команды /options: {e}")
+            await self.telegram_bot.send_message(f"❌ Ошибка: {e}", topic_id)
+
+    async def handle_review_command(self, topic_id: int):
+        """Обработка команды /review - проверить отзыв по invoice_id"""
+        try:
+            all_topics = self.topic_manager.get_all_topics()
+            target_topic = None
+            
+            for key, info in all_topics.items():
+                if info.get('topic_id') == topic_id:
+                    target_topic = info
+                    break
+            
+            if not target_topic:
+                await self.telegram_bot.send_message("❌ Топик не найден", topic_id)
+                return
+            
+            invoice_id = target_topic.get('invoice_id')
+            if not invoice_id:
+                await self.telegram_bot.send_message("❌ Нет invoice_id", topic_id)
+                return
+            
+            await self.telegram_bot.send_message(f"🔍 Ищу отзыв для #{invoice_id}...", topic_id)
+            
+            loop = asyncio.get_event_loop()
+            review = await loop.run_in_executor(
+                _executor, lambda: self.ggsel_api.get_review_by_invoice(invoice_id)
+            )
+            
+            if review:
+                review_type = review.get('type', 'good')
+                emoji = "👍" if review_type == 'good' else "👎"
+                info = review.get('info', '') or ''
+                name = review.get('name', '')
+                date = review.get('date', '')
+                review_id = review.get('id', '')
+                
+                msg = f"{emoji} Отзыв найден!\n\n"
+                msg += f"🆔 ID: {review_id}\n"
+                msg += f"📦 {name}\n" if name else ""
+                msg += f"📅 {date}\n" if date else ""
+                msg += f"📝 Тип: {review_type}\n"
+                if info:
+                    msg += f"\n💬 {info}"
+                
+                await self.telegram_bot.send_message(msg, topic_id)
+            else:
+                await self.telegram_bot.send_message(f"ℹ️ Отзыв для #{invoice_id} не найден", topic_id)
+            
+        except Exception as e:
+            logging.error(f"Ошибка команды /review: {e}")
             await self.telegram_bot.send_message(f"❌ Ошибка: {e}", topic_id)
