@@ -1,13 +1,12 @@
 import sqlite3
-import json
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Optional
 from dataclasses import dataclass
 
 @dataclass
 class Chat:
     id_i: int
-    email: Optional[str]  # Может быть None
+    email: Optional[str]
     product: int
     last_message: str
     cnt_msg: int
@@ -28,112 +27,61 @@ class Database:
         self.init_db()
     
     def init_db(self):
-        """Инициализация базы данных"""
+        """Initialize the core database structure for Single-user mode"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS chats (
-                    id_i INTEGER PRIMARY KEY,
-                    email TEXT,
-                    product INTEGER,
-                    last_message TEXT,
-                    cnt_msg INTEGER,
-                    cnt_new INTEGER,
-                    telegram_topic_id INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id_i INTEGER PRIMARY KEY, email TEXT, product INTEGER,
+                    last_message TEXT, cnt_msg INTEGER, cnt_new INTEGER,
+                    telegram_topic_id INTEGER, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER,
-                    message_id TEXT UNIQUE,
-                    content TEXT,
-                    timestamp TIMESTAMP,
-                    is_sent_to_telegram BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, message_id TEXT UNIQUE,
+                    content TEXT, timestamp TIMESTAMP, is_sent_to_telegram BOOLEAN DEFAULT FALSE,
                     FOREIGN KEY (chat_id) REFERENCES chats (id_i)
                 )
             ''')
             
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)
-            ''')
+            # Tables required for the JSON-to-SQLite migration and optimized lookups
+            conn.execute('CREATE TABLE IF NOT EXISTS topics (key TEXT PRIMARY KEY, data TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS purchases (invoice_id TEXT PRIMARY KEY, data TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS processed_reviews (review_id TEXT PRIMARY KEY, hash TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS pending_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)')
             
-            conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(is_sent_to_telegram)
-            ''')
-    
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)')
+            
     def save_chat(self, chat: Chat) -> None:
-        """Сохранение или обновление чата"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO chats 
-                (id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (chat.id_i, chat.email, chat.product, chat.last_message, 
-                  chat.cnt_msg, chat.cnt_new, chat.telegram_topic_id))
+            conn.execute('INSERT OR REPLACE INTO chats (id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)', 
+                        (chat.id_i, chat.email, chat.product, chat.last_message, chat.cnt_msg, chat.cnt_new, chat.telegram_topic_id))
     
     def get_chat(self, chat_id: int) -> Optional[Chat]:
-        """Получение чата по ID"""
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute('''
-                SELECT id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id
-                FROM chats WHERE id_i = ?
-            ''', (chat_id,))
+            cursor = conn.execute('SELECT id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id FROM chats WHERE id_i = ?', (chat_id,))
             row = cursor.fetchone()
-            if row:
-                return Chat(*row)
-        return None
-    
-    def get_all_chats(self) -> List[Chat]:
-        """Получение всех чатов"""
+            return Chat(*row) if row else None
+
+    def message_exists(self, message_id: str) -> bool:
+        """Check if a message already exists in the SQLite database"""
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute('''
-                SELECT id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id
-                FROM chats
-            ''')
-            return [Chat(*row) for row in cursor.fetchall()]
-    
+            cursor = conn.execute('SELECT 1 FROM messages WHERE message_id = ?', (message_id,))
+            return cursor.fetchone() is not None
+
     def save_message(self, message: Message) -> bool:
-        """Сохранение сообщения. Возвращает True если сообщение новое"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT INTO messages 
-                    (chat_id, message_id, content, timestamp, is_sent_to_telegram)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (message.chat_id, message.message_id, message.content, 
-                      message.timestamp, message.is_sent_to_telegram))
+                conn.execute('INSERT INTO messages (chat_id, message_id, content, timestamp, is_sent_to_telegram) VALUES (?, ?, ?, ?, ?)',
+                            (message.chat_id, message.message_id, message.content, message.timestamp, message.is_sent_to_telegram))
                 return True
-        except sqlite3.IntegrityError:
-            # Сообщение уже существует
-            return False
-    
+        except: return False
+
     def mark_message_sent(self, message_id: str) -> None:
-        """Отметить сообщение как отправленное в Telegram"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                UPDATE messages SET is_sent_to_telegram = TRUE 
-                WHERE message_id = ?
-            ''', (message_id,))
-    
+            conn.execute('UPDATE messages SET is_sent_to_telegram = TRUE WHERE message_id = ?', (message_id,))
+            
     def get_unsent_messages(self, chat_id: int) -> List[Message]:
-        """Получение неотправленных сообщений для чата"""
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute('''
-                SELECT chat_id, message_id, content, timestamp, is_sent_to_telegram
-                FROM messages 
-                WHERE chat_id = ? AND is_sent_to_telegram = FALSE
-                ORDER BY timestamp ASC
-            ''', (chat_id,))
+            cursor = conn.execute('SELECT chat_id, message_id, content, timestamp, is_sent_to_telegram FROM messages WHERE chat_id = ? AND is_sent_to_telegram = FALSE ORDER BY timestamp ASC', (chat_id,))
             return [Message(*row) for row in cursor.fetchall()]
-    
-    def update_telegram_topic_id(self, chat_id: int, topic_id: int) -> None:
-        """Обновление ID топика Telegram для чата"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                UPDATE chats SET telegram_topic_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id_i = ?
-            ''', (topic_id, chat_id))

@@ -1,125 +1,86 @@
 import json
-import os
 import logging
 from typing import Dict, Optional, List
 from datetime import datetime
 
 class TopicManager:
-    def __init__(self, topics_file: str = "topics.json"):
-        self.topics_file = topics_file
+    def __init__(self, db):
+        self.db = db
         self.topics: Dict[str, Dict] = self.load_topics()
     
     def load_topics(self) -> Dict[str, Dict]:
-        """Загрузка топиков из JSON файла"""
-        if os.path.exists(self.topics_file):
-            try:
-                with open(self.topics_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Ошибка загрузки топиков: {e}")
-        return {}
-    
-    def save_topics(self) -> None:
-        """Сохранение топиков в JSON файл"""
         try:
-            with open(self.topics_file, 'w', encoding='utf-8') as f:
-                json.dump(self.topics, f, indent=2, ensure_ascii=False)
+            with __import__('sqlite3').connect(self.db.db_path) as conn:
+                # FIXED: Querying 'key', not 'topic_key'
+                cursor = conn.execute("SELECT key, data FROM topics")
+                return {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
         except Exception as e:
-            print(f"Ошибка сохранения топиков: {e}")
-    
+            logging.error(f"Error loading topics from DB: {e}")
+            return {}
+            
+    def _save_single(self, key: str, data: dict):
+        self.topics[key] = data
+        try:
+            with __import__('sqlite3').connect(self.db.db_path) as conn:
+                conn.execute("INSERT OR REPLACE INTO topics (key, data) VALUES (?, ?)", (key, json.dumps(data)))
+        except Exception as e:
+            logging.error(f"Error saving topic to DB: {e}")
+
+    def _delete_single(self, key: str) -> bool:
+        if key in self.topics:
+            del self.topics[key]
+        try:
+            with __import__('sqlite3').connect(self.db.db_path) as conn:
+                conn.execute("DELETE FROM topics WHERE key = ?", (key,))
+            return True
+        except: return False
+
+    def get_all_topics(self) -> Dict[str, Dict]:
+        """Fetch fresh topics from SQLite"""
+        try:
+            with __import__('sqlite3').connect(self.db.db_path) as conn:
+                # FIXED: Querying 'key', not 'topic_key'
+                cursor = conn.execute("SELECT key, data FROM topics")
+                self.topics = {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
+        except Exception as e:
+            logging.error(f"Error getting all topics: {e}")
+        return self.topics.copy()
+
     def add_topic(self, chat_id: int, email: Optional[str], topic_id: int, topic_name: str) -> None:
-        """Добавление нового топика"""
         key = str(chat_id)
-        self.topics[key] = {
-            "chat_id": chat_id,
-            "email": email,
-            "topic_id": topic_id,
-            "topic_name": topic_name,
-            "created_at": datetime.now().isoformat()
+        data = {
+            "chat_id": chat_id, "email": email, "topic_id": topic_id, 
+            "topic_name": topic_name, "created_at": datetime.now().isoformat()
         }
-        self.save_topics()
+        self._save_single(key, data)
     
     def get_topic_id(self, chat_id: int) -> Optional[int]:
-        """Получение ID топика по ID чата"""
-        key = str(chat_id)
-        if key in self.topics:
-            return self.topics[key].get("topic_id")
-        return None
+        return self.topics.get(str(chat_id), {}).get("topic_id")
     
     def topic_exists(self, chat_id: int) -> bool:
-        """Проверка существования топика"""
         return str(chat_id) in self.topics
     
     def add_topic_for_purchase(self, purchase, topic_id: int, topic_name: str, chat_ids: List[int] = None) -> None:
-        """Добавление топика для покупки"""
-        # Используем invoice_id как основной ключ для простоты
         key = f"purchase_{purchase.invoice_id}"
-        
-        # Определяем customer_id для поиска
         customer_id = purchase.buyer_email or purchase.buyer_account or f"customer_{purchase.invoice_id}"
-        
-        self.topics[key] = {
-            "type": "purchase",
-            "invoice_id": purchase.invoice_id,
-            "customer_id": customer_id,
-            "email": purchase.buyer_email,
-            "account": purchase.buyer_account,
-            "topic_id": topic_id,
-            "topic_name": topic_name,
-            "chat_ids": chat_ids or [],  # Список ID чатов для этого покупателя
-            "created_at": datetime.now().isoformat()
+        data = {
+            "type": "purchase", "invoice_id": purchase.invoice_id, "customer_id": customer_id,
+            "email": purchase.buyer_email, "account": purchase.buyer_account, "topic_id": topic_id,
+            "topic_name": topic_name, "chat_ids": chat_ids or [], "created_at": datetime.now().isoformat()
         }
-        self.save_topics()
-    
-    def topic_exists_by_email(self, customer_id: str) -> bool:
-        """Проверка существования топика по email/account покупателя"""
-        # Ищем по customer_id в существующих топиках
-        for topic_data in self.topics.values():
-            if topic_data.get('type') == 'purchase':
-                if (topic_data.get('email') == customer_id or 
-                    topic_data.get('account') == customer_id or
-                    topic_data.get('customer_id') == customer_id):
-                    return True
-        return False
+        self._save_single(key, data)
     
     def get_topic_by_email(self, customer_id: str) -> Optional[Dict]:
-        """Получение топика по email/account покупателя"""
-        # Ищем по customer_id в существующих топиках
         for topic_data in self.topics.values():
             if topic_data.get('type') == 'purchase':
-                if (topic_data.get('email') == customer_id or 
-                    topic_data.get('account') == customer_id or
-                    topic_data.get('customer_id') == customer_id):
+                if topic_data.get('email') == customer_id or topic_data.get('account') == customer_id or topic_data.get('customer_id') == customer_id:
                     return topic_data
         return None
     
-    def get_all_topics(self) -> Dict[str, Dict]:
-        """Получение всех топиков"""
-        return self.topics.copy()
-    
     def update_topic_chat_ids(self, topic_key: str, chat_ids: List[int]) -> None:
-        """Обновление списка chat_ids для топика"""
         if topic_key in self.topics:
             self.topics[topic_key]['chat_ids'] = chat_ids
-            self.save_topics()
-            logging.info(f"Обновлены chat_ids для топика {topic_key}: {chat_ids}")
-        else:
-            logging.warning(f"Топик {topic_key} не найден для обновления chat_ids")
+            self._save_single(topic_key, self.topics[topic_key])
     
     def remove_topic(self, topic_key: str) -> bool:
-        """Удаление топика из базы"""
-        if topic_key in self.topics:
-            del self.topics[topic_key]
-            self.save_topics()
-            logging.info(f"Топик {topic_key} удалён из базы")
-            return True
-        return False
-    
-    def update_topic_search_time(self, topic_key: str, search_time: str) -> None:
-        """Обновление времени последнего поиска чатов для топика"""
-        if topic_key in self.topics:
-            self.topics[topic_key]['last_chat_search'] = search_time
-            self.save_topics()
-            logging.debug(f"Обновлено время поиска для топика {topic_key}")
-        else:
-            logging.warning(f"Топик {topic_key} не найден для обновления времени поиска")
+        return self._delete_single(topic_key)

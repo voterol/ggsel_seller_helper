@@ -1,29 +1,30 @@
 # 🤖 GGSel Telegram Bot
 
-Автоматический бот для продавцов GGSel — мониторинг покупок, двусторонняя связь с покупателями через Telegram.
+An automatic bot for GGSel sellers — monitoring purchases and two-way communication with buyers through Telegram.
 
-## ✨ Возможности
+## ✨ Features
 
-| Функция | Описание |
-|---------|----------|
-| 📦 **Мониторинг покупок** | Автоматическое создание топиков для новых заказов |
-| 💬 **Двусторонняя связь** | Сообщения из GGSel ↔ Telegram в реальном времени |
-| 🤖 **Автоответы** | Приветствия, триггеры на ключевые слова |
-| ⭐ **Ответы на отзывы** | Автоматические ответы на хорошие/плохие отзывы |
-| 🎯 **Режим ЧСВ** | Реакция на опции покупки с условиями |
+| Function                     | Description                                    |
+| ---------------------------- | ---------------------------------------------- |
+| 📦 **Purchase monitoring**   | Automatically creates topics for new orders    |
+| 💬 **Two-way communication** | Messages from GGSel ↔ Telegram in real time    |
+| 🤖 **Auto-replies**          | Greetings and keyword trigger responses        |
+| ⭐ **Review replies**         | Automatic replies to positive/negative reviews |
+| 🎯 **CSV mode**              | Reacts to purchase options with conditions     |
+
 
 ---
 
-## 🚀 Установка
+## 🚀 Installation
 
-### 1. Клонируйте репозиторий
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/voterol/ggsel_seller_helper/
+git clone https://github.com/paparei/ggsel_seller_helper
 cd ggsel_seller_helper/
 ```
 
-### 2. Создайте виртуальное окружение (рекомендуется)
+### 2. Create a virtual environment (recommended)
 
 ```bash
 python -m venv venv
@@ -35,22 +36,22 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-### 3. Установите зависимости
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Создайте файл `.env`
+### 4. Create the .env file
 
 ```bash
 cp .env.example .env
 ```
 
-Отредактируйте `.env` и заполните данные:
+Edit .env and fill in your details:
 
 ```env
-# GGSel API (из личного кабинета продавца)
+# GGSel API (from your seller dashboard)
 GGSEL_SELLER_ID=1234567
 GGSEL_API_KEY=your_api_key_here
 
@@ -61,20 +62,20 @@ TELEGRAM_GROUP_ID=-1001234567890
 
 ### 5. Настройте Telegram
 
-1. Создайте бота через [@BotFather](https://t.me/BotFather) → получите токен
-2. Создайте группу и включите "Темы" (Topics) в настройках группы
-3. Добавьте бота в группу
-4. Сделайте бота администратором с правами:
-   - ✅ Управление темами
-   - ✅ Отправка сообщений
-   - ✅ Удаление сообщений
+1. Create a bot via [@BotFather](https://t.me/BotFather) → get the token
+2. Create a group and enable Topics in group settings
+3. Add the bot to the group
+4. Make the bot an administrator with permissions:
+   - ✅ Manage topics
+   - ✅ Send messages
+   - ✅ Delete messages
 
-5. Получите ID группы:
-   - Добавьте [@userinfobot](https://t.me/userinfobot) в группу
-   - Или перешлите сообщение из группы боту [@userinfobot](https://t.me/userinfobot)
-   - ID будет вида `-100xxxxxxxxxx`
+5. Get the group ID::
+   - Add [@userinfobot](https://t.me/userinfobot) to the group
+   - Or forward a message from the group to [@userinfobot](https://t.me/userinfobot)
+   - The ID will look like `-100xxxxxxxxxx`
 
-### 6. Запустите бота
+### 6. Run the bot
 
 ```bash
 python main.py
@@ -84,11 +85,11 @@ python main.py
 
 ## ⚙️ Команды бота
 
-| Команда | Где использовать | Описание |
-|---------|------------------|----------|
-| `/auto` | В группе | Меню настроек автоответов и режима ЧСВ |
-| `/history` | В топике | Загрузить историю сообщений |
-| `/options` | В топике | Показать опции покупки |
+| Command    | Where to use | Description                      |
+| ---------- | ------------ | -------------------------------- |
+| `/menu`    | In group     | Main menu |
+| `/history` | In topic     | Load message history             |
+| `/options` | In topic     | Show purchase options            |
 
 ---
 
@@ -104,13 +105,13 @@ python main.py
 | 🎯 `value` | По названию И значению | Опция "Чай" = "20р" |
 | 🔍 `contains` | Значение содержит | Опция "Чай" содержит "20" |
 
-### Переменные в сообщениях
+### Variables in messages
 
-- `{option}` — название опции
-- `{value}` — значение опции
-- `{sum}` — алиас для {value}
+- `{option}` — option name
+- `{value}` — option value
+- `{sum}` — alias for {value}
 
-**Пример:** Если покупатель выбрал "Чай: 20р", можно отправить ему: `Спасибо за чай на {sum}! ☕`
+**Example:** If the buyer selected “Tea: 20₽”, the bot can send: `Thanks for the tea for {sum}! ☕`
 
 ---
 
@@ -123,16 +124,16 @@ python main.py
 └─────────────┘     └─────────────┘     └─────────────┘
 ```
 
-1. Бот проверяет новые покупки через GGSel API
-2. Для каждой покупки создаётся топик в Telegram
-3. Сообщения от покупателя пересылаются в топик
-4. Ваши ответы в топике отправляются покупателю
+1. The bot checks new purchases through the GGSel API
+2. A Telegram topic is created for each purchase
+3. Buyer messages are forwarded to the topic
+4. Your replies in the topic are sent back to the buyer
 
 ---
 
-## 🔧 Запуск как сервис (Linux)
+## 🔧 Run as a service (Linux)
 
-Создайте файл `/etc/systemd/system/ggsel-bot.service`:
+Create `/etc/systemd/system/ggsel-bot.service`:
 
 ```ini
 [Unit]
@@ -159,7 +160,7 @@ sudo systemctl start ggsel-bot
 
 ---
 
-## 📁 Структура
+## 📁 Structure
 
 ```
 ggsel_bot/
@@ -176,20 +177,21 @@ ggsel_bot/
 
 ## ❓ FAQ
 
-**Бот не создаёт топики**
-- Проверьте что группа — форум (включены темы)
-- Проверьте права бота (администратор + управление темами)
+**Bot doesn’t create topics**
+- Make sure the group is a forum (topics enabled)
+- Check bot permissions (admin + manage topics)
 
-**Сообщения не отправляются**
-- Проверьте `GGSEL_API_KEY` и `GGSEL_SELLER_ID`
-- Посмотрите логи в `ggsel_bot.log`
+**Messages are not sent**
+- Check `GGSEL_API_KEY` and `GGSEL_SELLER_ID`
+- Look at logs in `ggsel_bot.log`
 
-**Как получить GGSel API ключ?**
-- Личный кабинет продавца → Настройки → API
+**How to get a GGSel API key?**
+- Seller dashboard → Settings → API
 
 ---
 
-## 📝 Лицензия
+## 📝 License
 
 MIT
+
 

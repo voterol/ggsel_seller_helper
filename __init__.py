@@ -1,2 +1,3 @@
 # GGSel Telegram Bot
-__version__ = "1.0.6"
+
+__version__ = "2.0"
