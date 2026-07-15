@@ -20,9 +20,57 @@ An automatic bot for GGSel sellers — monitoring purchases and two-way communic
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/paparei/ggsel_seller_helper
+git clone https://github.com/voterol/ggsel_seller_helper.git
 cd ggsel_seller_helper/
 ```
+
+### Optional verified automatic updates
+
+Automatic updating is disabled unless it is explicitly opted into. Updates are
+accepted only from a named release tag whose downloaded ZIP matches a pinned
+SHA-256 digest. The updater never downloads the mutable `main.zip` archive.
+
+```env
+AUTO_UPDATE=true
+UPDATE_VERSION=1.2.3
+UPDATE_SHA256=<64 lowercase or uppercase hexadecimal characters>
+```
+
+Obtain the checksum for the exact release asset before enabling it, for example:
+
+```bash
+curl -fL -o ggsel-update.zip \
+  https://github.com/voterol/ggsel_seller_helper/archive/refs/tags/1.2.3.zip
+shasum -a 256 ggsel-update.zip
+```
+
+Installation is attempted **only during process startup**, before file logging,
+`BotService` construction, database migration, or any SQLite connection. The
+two-hour periodic task is notification-only: it checks the pinned tag but never
+downloads, extracts, swaps files, or restarts the running bot. A newly noticed
+release is therefore downloaded, hash-verified, and installed on a later
+service startup, not while SQLite is active.
+
+On successful startup installation, the previous application directory is
+retained beside the install as `ggsel_seller_helper.update-backup`, and the
+process exits so the service manager starts the new code cleanly. Runtime state
+is preserved by this explicit allowlist:
+
+- `.env`;
+- `venv/` and `.venv/`;
+- `bot_lang.json`, `orders.json`, `autoresponder.json`, and
+  `autoresponder_config.json`;
+- `topics.json`, `pending_topics.json`, `processed_reviews.json`,
+  `processed_purchases.json`, and `processed_messages.json`;
+- `ggsel_bot.log`;
+- the configured in-tree `DATABASE_PATH` plus SQLite `-wal`, `-shm`, and
+  `-journal` sidecars.
+
+An absolute database path outside the deploy directory is not touched. Relative
+database paths that escape the deploy directory, symlinked in-tree database
+paths, and paths inside updater backup directories are rejected before swap.
+Keep independent backups; this allowlist intentionally does not preserve
+arbitrary files added to the application directory.
 
 ### 2. Create a virtual environment (recommended)
 
@@ -35,6 +83,12 @@ venv\Scripts\activate
 # Linux/Mac
 source venv/bin/activate
 ```
+
+For a production service with automatic updates, prefer a virtual environment
+outside the replaceable deploy directory, for example `/opt/ggsel-venv`. The
+updater preserves an existing in-tree directory named `venv` for compatibility,
+but keeping the interpreter outside the deploy makes the service lifecycle
+independent of an application-directory swap.
 
 ### 3. Install dependencies
 
@@ -58,7 +112,13 @@ GGSEL_API_KEY=your_api_key_here
 # Telegram
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 TELEGRAM_GROUP_ID=-1001234567890
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 ```
+
+`TELEGRAM_ALLOWED_USER_IDS` is a comma- or space-separated allowlist of
+positive Telegram user IDs. Bot commands, callbacks, and topic replies are
+denied by default: if this setting is missing or empty, no user is authorized,
+even if they are a member or administrator of the configured group.
 
 ### 5. Настройте Telegram
 
@@ -144,7 +204,7 @@ After=network.target
 Type=simple
 User=your_user
 WorkingDirectory=/path/to/ggsel_bot
-ExecStart=/path/to/venv/bin/python main.py
+ExecStart=/opt/ggsel-venv/bin/python main.py
 Restart=always
 RestartSec=10
 

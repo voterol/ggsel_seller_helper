@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import tempfile
+import threading
 from typing import Dict, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ class Order:
 class OrderManager:
     def __init__(self, orders_file: str = "orders.json"):
         self.orders_file = orders_file
+        self._lock = threading.RLock()
         self.orders: Dict[str, Dict] = self.load_orders()
     
     def load_orders(self) -> Dict[str, Dict]:
@@ -33,13 +36,26 @@ class OrderManager:
                 print(f"Ошибка загрузки заказов: {e}")
         return {}
     
-    def save_orders(self) -> None:
+    def save_orders(self) -> bool:
         """Сохранение заказов в JSON файл"""
+        directory = os.path.dirname(os.path.abspath(self.orders_file))
+        temporary = None
         try:
-            with open(self.orders_file, 'w', encoding='utf-8') as f:
+            fd, temporary = tempfile.mkstemp(prefix='.orders-', suffix='.tmp', dir=directory)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(self.orders, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.orders_file)
+            return True
         except Exception as e:
             print(f"Ошибка сохранения заказов: {e}")
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+            return False
     
     def parse_order_message(self, message_text: str) -> Optional[Order]:
         """Парсинг сообщения о новом заказе"""
@@ -90,26 +106,30 @@ class OrderManager:
         """Добавление нового заказа"""
         try:
             key = str(order.id_i)
+            with self._lock:
+                # Проверяем, не существует ли уже такой заказ
+                if key in self.orders:
+                    return False
             
-            # Проверяем, не существует ли уже такой заказ
-            if key in self.orders:
+                self.orders[key] = {
+                    "id_i": order.id_i,
+                    "id_d": order.id_d,
+                    "amount": order.amount,
+                    "currency": order.currency,
+                    "email": order.email,
+                    "date": order.date,
+                    "sha256": order.sha256,
+                    "ip": order.ip,
+                    "is_my_product": order.is_my_product,
+                    "created_at": order.created_at
+                }
+
+                if self.save_orders():
+                    return True
+                # Do not claim success or retain an in-memory order that was
+                # not durably persisted.
+                del self.orders[key]
                 return False
-            
-            self.orders[key] = {
-                "id_i": order.id_i,
-                "id_d": order.id_d,
-                "amount": order.amount,
-                "currency": order.currency,
-                "email": order.email,
-                "date": order.date,
-                "sha256": order.sha256,
-                "ip": order.ip,
-                "is_my_product": order.is_my_product,
-                "created_at": order.created_at
-            }
-            
-            self.save_orders()
-            return True
             
         except Exception as e:
             print(f"Ошибка добавления заказа: {e}")

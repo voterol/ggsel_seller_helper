@@ -11,6 +11,8 @@
 import json
 import os
 import logging
+import copy
+import tempfile
 from typing import Dict, List, Optional
 
 
@@ -35,6 +37,15 @@ class AutoResponder:
             "rules": []
         }
     }
+    MAX_TEXT_LENGTH = 4000
+    MAX_MATCH_LENGTH = 500
+    TRIGGER_FIELDS = frozenset({
+        "phrase", "response", "enabled", "notify_group", "notify_text", "exact_match"
+    })
+    CSV_RULE_FIELDS = frozenset({
+        "option_name", "option_value", "match_type", "case_sensitive", "enabled",
+        "send_to_user", "user_message", "send_to_topic", "topic_message"
+    })
     
     def __init__(self, config_file: str = None):
         if config_file is None:
@@ -49,14 +60,19 @@ class AutoResponder:
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                    if not isinstance(data, dict):
+                        raise ValueError("top-level configuration must be an object")
                     return self._merge_config(data, self.DEFAULT_CONFIG)
-            except Exception as e:
-                logging.error(f"Ошибка загрузки конфига автоответов: {e}")
-        return self.DEFAULT_CONFIG.copy()
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                # Do not log the path or raw config: it may contain customer text.
+                logging.error("Не удалось загрузить конфигурацию автоответов")
+        return copy.deepcopy(self.DEFAULT_CONFIG)
     
     def _merge_config(self, data: Dict, default: Dict) -> Dict:
         """Рекурсивный мерж конфига с дефолтными значениями."""
-        result = default.copy()
+        if not isinstance(data, dict):
+            return copy.deepcopy(default)
+        result = copy.deepcopy(default)
         for key, value in data.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = self._merge_config(value, result[key])
@@ -66,11 +82,33 @@ class AutoResponder:
     
     def save_config(self):
         """Сохранение конфигурации в файл."""
+        temp_name = None
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            parent = os.path.dirname(os.path.abspath(self.config_file))
+            with tempfile.NamedTemporaryFile(
+                'w', encoding='utf-8', dir=parent, delete=False
+            ) as f:
+                temp_name = f.name
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logging.error(f"Ошибка сохранения автоответов: {e}")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, self.config_file)
+        except (OSError, TypeError, ValueError):
+            logging.error("Не удалось сохранить конфигурацию автоответов")
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+    @classmethod
+    def _text(cls, value, max_length: int = None) -> str:
+        """Normalize untrusted text before matching, persistence, or delivery."""
+        if not isinstance(value, str):
+            return ""
+        limit = max_length or cls.MAX_TEXT_LENGTH
+        return "".join(ch for ch in value if ch in "\n\r\t" or ord(ch) >= 32)[:limit]
     
     # ==================== Основные настройки ====================
     
@@ -94,14 +132,14 @@ class AutoResponder:
         return self.config.get("first_message_text", "")
     
     def set_first_message_text(self, text: str):
-        self.config["first_message_text"] = text
+        self.config["first_message_text"] = self._text(text)
         self.save_config()
     
     def get_notify_text(self) -> str:
         return self.config.get("notify_text", "🔔 Требуется ответ!")
     
     def set_notify_text(self, text: str):
-        self.config["notify_text"] = text
+        self.config["notify_text"] = self._text(text)
         self.save_config()
     
     def should_send_first_message(self) -> bool:
@@ -110,18 +148,19 @@ class AutoResponder:
     # ==================== Триггеры ====================
     
     def get_triggers(self) -> List[Dict]:
-        return self.config.get("triggers", [])
+        triggers = self.config.get("triggers", [])
+        return triggers if isinstance(triggers, list) else []
     
     def add_trigger(self, phrase: str, response: str, notify_group: bool = False, 
                     notify_text: str = "", exact_match: bool = False) -> int:
         """Добавить триггер. Возвращает индекс."""
         triggers = self.config.setdefault("triggers", [])
         triggers.append({
-            "phrase": phrase.lower(),
-            "response": response,
+            "phrase": self._text(phrase, self.MAX_MATCH_LENGTH).lower(),
+            "response": self._text(response),
             "enabled": True,
             "notify_group": notify_group,
-            "notify_text": notify_text,
+            "notify_text": self._text(notify_text),
             "exact_match": exact_match
         })
         self.save_config()
@@ -142,7 +181,13 @@ class AutoResponder:
     def update_trigger(self, index: int, **kwargs) -> bool:
         triggers = self.get_triggers()
         if 0 <= index < len(triggers):
-            triggers[index].update(kwargs)
+            updates = {key: value for key, value in kwargs.items() if key in self.TRIGGER_FIELDS}
+            if "phrase" in updates:
+                updates["phrase"] = self._text(updates["phrase"], self.MAX_MATCH_LENGTH).lower()
+            for key in ("response", "notify_text"):
+                if key in updates:
+                    updates[key] = self._text(updates[key])
+            triggers[index].update(updates)
             self.save_config()
             return True
         return False
@@ -176,9 +221,11 @@ class AutoResponder:
         if not self.is_enabled():
             return None
         
-        message_lower = message.lower().strip()
+        message_lower = self._text(message).lower().strip()
         
         for trigger in self.get_triggers():
+            if not isinstance(trigger, dict):
+                continue
             if not trigger.get("enabled", True):
                 continue
             
@@ -225,7 +272,7 @@ class AutoResponder:
         return self._get_review_config().get("good_text", "Спасибо за отзыв! 🙏")
     
     def set_good_review_text(self, text: str):
-        self._get_review_config()["good_text"] = text
+        self._get_review_config()["good_text"] = self._text(text)
         self.save_config()
     
     def is_bad_review_response_enabled(self) -> bool:
@@ -241,7 +288,7 @@ class AutoResponder:
         return self._get_review_config().get("bad_text", "Извините за неудобства.")
     
     def set_bad_review_text(self, text: str):
-        self._get_review_config()["bad_text"] = text
+        self._get_review_config()["bad_text"] = self._text(text)
         self.save_config()
     
     def get_review_response(self, review_type: str) -> Optional[str]:
@@ -271,7 +318,12 @@ class AutoResponder:
         return config["enabled"]
     
     def get_csv_rules(self) -> List[Dict]:
-        return self._get_csv_config().setdefault("rules", [])
+        config = self._get_csv_config()
+        rules = config.setdefault("rules", [])
+        if not isinstance(rules, list):
+            config["rules"] = []
+            return config["rules"]
+        return rules
     
     def add_csv_rule(self, option_name: str, option_value: str = "", 
                      match_type: str = "name", case_sensitive: bool = False,
@@ -302,15 +354,15 @@ class AutoResponder:
         
         rules = self.get_csv_rules()
         rules.append({
-            "option_name": option_name,
-            "option_value": option_value,
+            "option_name": self._text(option_name, self.MAX_MATCH_LENGTH),
+            "option_value": self._text(option_value, self.MAX_MATCH_LENGTH),
             "match_type": match_type,
             "case_sensitive": case_sensitive,
             "enabled": True,
             "send_to_user": send_to_user,
-            "user_message": user_message,
+            "user_message": self._text(user_message),
             "send_to_topic": send_to_topic,
-            "topic_message": topic_message
+            "topic_message": self._text(topic_message)
         })
         self.save_config()
         return len(rules) - 1
@@ -330,7 +382,16 @@ class AutoResponder:
     def update_csv_rule(self, index: int, **kwargs) -> bool:
         rule = self.get_csv_rule(index)
         if rule:
-            rule.update(kwargs)
+            updates = {key: value for key, value in kwargs.items() if key in self.CSV_RULE_FIELDS}
+            if updates.get("match_type") not in (None, "name", "value", "contains"):
+                updates["match_type"] = "name"
+            for key in ("option_name", "option_value"):
+                if key in updates:
+                    updates[key] = self._text(updates[key], self.MAX_MATCH_LENGTH)
+            for key in ("user_message", "topic_message"):
+                if key in updates:
+                    updates[key] = self._text(updates[key])
+            rule.update(updates)
             self.save_config()
             return True
         return False
@@ -400,19 +461,23 @@ class AutoResponder:
         Returns:
             Список сработавших правил с данными для отправки
         """
-        if not self.is_csv_mode_enabled():
+        if not self.is_csv_mode_enabled() or not isinstance(options, list):
             return []
         
         results = []
         
         for option in options:
-            option_name = option.get("name", "")
-            option_value = option.get("user_data", "")
+            if not isinstance(option, dict):
+                continue
+            option_name = self._text(option.get("name", ""), self.MAX_MATCH_LENGTH)
+            option_value = self._text(option.get("user_data", ""), self.MAX_TEXT_LENGTH)
             
             if not option_name:
                 continue
             
             for rule in self.get_csv_rules():
+                if not isinstance(rule, dict):
+                    continue
                 if not rule.get("enabled", True):
                     continue
                 

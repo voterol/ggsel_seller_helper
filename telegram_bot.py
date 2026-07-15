@@ -3,7 +3,7 @@ import logging
 from typing import Optional, Tuple
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
-from telegram.error import TelegramError, RetryAfter
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 from config import Config
 from locales import locales, _ 
 
@@ -12,6 +12,7 @@ class TelegramBot:
         self.config = config
         self.bot = Bot(token=config.telegram_bot_token)
         self.group_id = config.telegram_group_id
+        self.allowed_user_ids = frozenset(getattr(config, 'telegram_allowed_user_ids', frozenset()))
         self.application = None
         self.topic_message_handler = None
         self.callback_handler = None 
@@ -28,6 +29,11 @@ class TelegramBot:
     def set_review_handler(self, h): self.review_handler = h
 
     async def start(self):
+        self.config.validate()
+        if not self.allowed_user_ids:
+            logging.warning(
+                "TELEGRAM_ALLOWED_USER_IDS is empty; all Telegram operator actions will be denied"
+            )
         try:
             self.application = Application.builder().token(self.config.telegram_bot_token).build()
             self.application.add_handler(CommandHandler("menu", self._handle_menu_command))
@@ -49,26 +55,58 @@ class TelegramBot:
             await self.application.updater.start_polling()
             return True
         except Exception as e:
-            logging.error(f"Telegram init error: {e}")
-            return False
+            logging.exception("Telegram startup failed")
+            # BotService historically ignores the boolean return value. Raising
+            # prevents it from reporting a successful start and spawning jobs.
+            raise RuntimeError(f"Telegram startup failed: {e}") from e
 
     async def send_message(self, text: str, topic_id: int, parse_mode: str = None, reply_markup = None) -> Tuple[bool, Optional[int]]:
         """Accepts parse_mode and reply_markup for rich notifications"""
         try:
-            if topic_id == -1: 
+            if topic_id in (-1, None):
                 await self.bot.send_message(chat_id=self.group_id, text=text[:4000], parse_mode=parse_mode, reply_markup=reply_markup)
             else: 
                 await self.bot.send_message(chat_id=self.group_id, message_thread_id=topic_id, text=text[:4000], parse_mode=parse_mode, reply_markup=reply_markup)
             return True, None
-        except RetryAfter as e: 
+        except RetryAfter as e:
             return False, e.retry_after
-        except Exception as e:
-            logging.error(f"Telegram send error: {e}")
+        except (BadRequest, Forbidden, InvalidToken) as e:
+            # Retrying malformed requests, revoked tokens, or inaccessible chats
+            # creates an endless pending-message loop.
+            logging.error(f"Permanent Telegram send error: {e}")
+            return False, None
+        except (TimedOut, NetworkError) as e:
+            logging.warning(f"Retryable Telegram send error: {e}")
             return False, 60
+        except TelegramError as e:
+            logging.warning(f"Telegram send error (will retry): {e}")
+            return False, 60
+        except Exception as e:
+            # Preserve the historical non-raising send boundary for callers.
+            logging.exception("Unexpected Telegram send error")
+            return False, 60
+
+    async def send_message_with_keyboard(self, text: str, keyboard, topic_id: int = None):
+        """Compatibility helper returning the same ``(success, retry_after)`` contract."""
+        reply_markup = keyboard if isinstance(keyboard, InlineKeyboardMarkup) else InlineKeyboardMarkup(keyboard)
+        return await self.send_message(text, topic_id, reply_markup=reply_markup)
+
+    def _is_authorized(self, update: Update) -> bool:
+        chat = getattr(update, 'effective_chat', None)
+        user = getattr(update, 'effective_user', None)
+        authorized = bool(
+            chat and chat.id == self.group_id and user and user.id in self.allowed_user_ids
+        )
+        if not authorized:
+            logging.warning(
+                "Denied Telegram operator action (chat_id=%s, user_id=%s)",
+                getattr(chat, 'id', None), getattr(user, 'id', None)
+            )
+        return authorized
 
     # ... keep the rest of the methods exactly as they are ...
     async def _handle_menu_command(self, update: Update, context):
-        if update.effective_chat.id != self.group_id: return
+        if not self._is_authorized(update): return
         keyboard = [
             [InlineKeyboardButton(_("btn_auto"), callback_data="auto_menu")],
             [InlineKeyboardButton(_("btn_balance"), callback_data="check_balance")],
@@ -87,9 +125,12 @@ class TelegramBot:
 
     async def _handle_callback(self, update: Update, context):
         query = update.callback_query
+        if not self._is_authorized(update):
+            try: await query.answer("Not authorized", show_alert=True)
+            except TelegramError: pass
+            return
         try: await query.answer()
-        except: pass
-        if query.message.chat.id != self.group_id: return
+        except TelegramError: pass
         if query.data == "close":
             await query.message.delete()
             return
@@ -137,24 +178,24 @@ class TelegramBot:
             await self.application.shutdown()
 
     async def _handle_topic_message(self, update: Update, context):
-        if update.message and update.message.text and not update.message.from_user.is_bot:
+        if self._is_authorized(update) and update.message and update.message.text and not update.message.from_user.is_bot:
             if self.topic_message_handler:
                 self.topic_message_handler(update.message.message_thread_id, update.message.text, 
                                          update.message.from_user.username or "User", update.message.message_id)
 
     async def _handle_general_message(self, update: Update, context):
-        if update.message and update.message.text and not update.message.from_user.is_bot:
+        if self._is_authorized(update) and update.message and update.message.text and not update.message.from_user.is_bot:
             if self.general_message_handler:
                 await self.general_message_handler(update.message.text)
 
     async def _handle_history_command(self, update: Update, context):
-        if update.effective_chat.id == self.group_id and update.message.message_thread_id and self.history_handler:
+        if self._is_authorized(update) and update.message.message_thread_id and self.history_handler:
             await self.history_handler(update.message.message_thread_id)
 
     async def _handle_options_command(self, update: Update, context):
-        if update.effective_chat.id == self.group_id and update.message.message_thread_id and self.options_handler:
+        if self._is_authorized(update) and update.message.message_thread_id and self.options_handler:
             await self.options_handler(update.message.message_thread_id)
 
     async def _handle_review_command(self, update: Update, context):
-        if update.effective_chat.id == self.group_id and update.message.message_thread_id and self.review_handler:
+        if self._is_authorized(update) and update.message.message_thread_id and self.review_handler:
             await self.review_handler(update.message.message_thread_id)

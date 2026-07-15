@@ -1,140 +1,102 @@
 #!/usr/bin/env python3
-"""
-Скрипт для исправления дублированных записей в processed_messages.json
-после исправления бага с chat_id=0
-"""
+"""Safely normalize legacy processed-message keys without deleting records."""
 
+import argparse
 import json
 import os
+import shutil
+import tempfile
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
 
-def fix_processed_messages():
-    """Исправляет дублированные записи в processed_messages.json"""
-    
-    messages_file = "processed_messages.json"
-    backup_file = f"processed_messages_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    if not os.path.exists(messages_file):
-        print(f"❌ Файл {messages_file} не найден")
-        return
-    
-    # Создаем бэкап
-    try:
-        with open(messages_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        with open(backup_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ Создан бэкап: {backup_file}")
-    except Exception as e:
-        print(f"❌ Ошибка создания бэкапа: {e}")
-        return
-    
-    # Анализируем данные
-    print(f"\n📊 Анализ данных:")
-    print(f"Всего записей: {len(data)}")
-    
-    # Ищем записи с chat_id=0
-    zero_chat_records = {}
-    normal_records = {}
-    
-    for key, record in data.items():
-        chat_id = record.get('chat_id', 0)
-        message_id = record.get('message_id', '')
-        
-        if chat_id == 0:
-            zero_chat_records[key] = record
-        else:
-            normal_records[key] = record
-    
-    print(f"Записей с chat_id=0: {len(zero_chat_records)}")
-    print(f"Нормальных записей: {len(normal_records)}")
-    
-    if not zero_chat_records:
-        print("✅ Записей с chat_id=0 не найдено, исправление не требуется")
-        return
-    
-    # Удаляем записи с chat_id=0
-    cleaned_data = normal_records.copy()
-    
-    # Сохраняем исправленные данные
-    try:
-        with open(messages_file, 'w', encoding='utf-8') as f:
-            json.dump(cleaned_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n✅ Исправлено!")
-        print(f"Удалено записей с chat_id=0: {len(zero_chat_records)}")
-        print(f"Осталось записей: {len(cleaned_data)}")
-        
-    except Exception as e:
-        print(f"❌ Ошибка сохранения: {e}")
-        # Восстанавливаем из бэкапа
-        try:
-            with open(backup_file, 'r', encoding='utf-8') as f:
-                backup_data = json.load(f)
-            with open(messages_file, 'w', encoding='utf-8') as f:
-                json.dump(backup_data, f, indent=2, ensure_ascii=False)
-            print(f"🔄 Восстановлено из бэкапа")
-        except:
-            print(f"💥 Критическая ошибка! Восстановите вручную из {backup_file}")
 
-def show_statistics():
-    """Показывает статистику по сообщениям"""
-    
-    messages_file = "processed_messages.json"
-    
-    if not os.path.exists(messages_file):
-        print(f"❌ Файл {messages_file} не найден")
-        return
-    
+DEFAULT_MESSAGES_FILE = os.getenv("PROCESSED_MESSAGES_PATH", "processed_messages.json")
+
+
+def _load(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("processed messages must contain a JSON object")
+    if any(not isinstance(record, dict) for record in data.values()):
+        raise ValueError("every processed message must be a JSON object")
+    return data
+
+
+def _unique_key(result: Dict[str, Any], preferred: str) -> str:
+    if preferred not in result:
+        return preferred
+    suffix = 2
+    while f"{preferred}#{suffix}" in result:
+        suffix += 1
+    return f"{preferred}#{suffix}"
+
+
+def fix_processed_messages(messages_file: str = DEFAULT_MESSAGES_FILE) -> str:
+    """Rewrite keys to chat_id:message_id while preserving every input record.
+
+    Returns the backup path. The original is replaced atomically only after the
+    replacement has been written and fsynced successfully.
+    """
+    path = Path(messages_file).expanduser()
+    data = _load(path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = path.with_name(f"{path.stem}_backup_{timestamp}{path.suffix}")
+    shutil.copy2(path, backup)
+
+    normalized: Dict[str, Any] = {}
+    for old_key, record in data.items():
+        chat_id = record.get("chat_id", 0)
+        message_id = str(record.get("message_id", old_key))
+        key = _unique_key(normalized, f"{chat_id}:{message_id}")
+        normalized[key] = record
+
+    temp_name = None
     try:
-        with open(messages_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"❌ Ошибка чтения файла: {e}")
-        return
-    
-    print(f"\n📈 Статистика processed_messages.json:")
-    print(f"Всего записей: {len(data)}")
-    
-    # Группируем по chat_id
-    chat_stats = {}
-    sent_count = 0
-    
-    for key, record in data.items():
-        chat_id = record.get('chat_id', 0)
-        sent_to_telegram = record.get('sent_to_telegram', False)
-        
-        if chat_id not in chat_stats:
-            chat_stats[chat_id] = 0
-        chat_stats[chat_id] += 1
-        
-        if sent_to_telegram:
-            sent_count += 1
-    
-    print(f"Отправлено в Telegram: {sent_count}")
-    print(f"Не отправлено: {len(data) - sent_count}")
-    
-    print(f"\nПо чатам:")
-    for chat_id, count in sorted(chat_stats.items()):
-        if chat_id == 0:
-            print(f"  Chat ID 0 (ПРОБЛЕМА!): {count} записей")
-        else:
-            print(f"  Chat ID {chat_id}: {count} записей")
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(path.parent),
+            prefix=path.name + ".", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_name = handle.name
+            json.dump(normalized, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+        # os.replace is atomic; if it somehow completed before a later error,
+        # restore the byte-for-byte backup.
+        shutil.copy2(backup, path)
+        raise
+    return str(backup)
+
+
+def show_statistics(messages_file: str = DEFAULT_MESSAGES_FILE) -> Dict[str, int]:
+    data = _load(Path(messages_file).expanduser())
+    zero_chat = sum(record.get("chat_id", 0) == 0 for record in data.values())
+    sent = sum(bool(record.get("sent_to_telegram", record.get("is_sent_to_telegram", False))) for record in data.values())
+    stats = {"total": len(data), "chat_id_zero": zero_chat, "sent": sent}
+    print(json.dumps(stats, ensure_ascii=False))
+    return stats
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Normalize processed-message identities safely")
+    parser.add_argument("--messages", default=DEFAULT_MESSAGES_FILE, help="Legacy JSON path")
+    parser.add_argument("--apply", action="store_true", help="Create backup and normalize keys")
+    args = parser.parse_args()
+    show_statistics(args.messages)
+    if args.apply:
+        backup = fix_processed_messages(args.messages)
+        print(f"Normalized without deleting records. Backup: {backup}")
+    else:
+        print("Dry run only; pass --apply to modify the file.")
+
 
 if __name__ == "__main__":
-    print("🔧 Исправление дублированных записей в GGSel Bot")
-    print("=" * 50)
-    
-    show_statistics()
-    
-    print("\n" + "=" * 50)
-    response = input("Исправить записи с chat_id=0? (y/N): ").strip().lower()
-    
-    if response in ['y', 'yes', 'да']:
-        fix_processed_messages()
-        print("\n" + "=" * 50)
-        show_statistics()
-    else:
-        print("❌ Отменено")
+    main()

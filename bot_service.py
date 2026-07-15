@@ -44,6 +44,7 @@ class BotService:
         self.pending_history_loads = []
         self.awaiting_input = {}
         self.processed_reviews = {}
+        self._review_lock = asyncio.Lock()
         self.failed_topics = {}
         self.chat_locks = {}
         
@@ -71,13 +72,52 @@ class BotService:
         except Exception as e:
             logging.error(f"Error loading reviews from DB: {e}")
 
-    def _save_processed_review_db(self, review_id: str, hash_val: str):
-        self.processed_reviews[review_id] = hash_val
+    def _save_processed_review_db(self, review_id: str, hash_val: str) -> bool:
         try:
             with sqlite3.connect(self.database.db_path) as conn:
                 conn.execute("INSERT OR REPLACE INTO processed_reviews (review_id, hash) VALUES (?, ?)", (review_id, hash_val))
+            self.processed_reviews[review_id] = hash_val
+            return True
         except Exception as e:
             logging.error(f"Error saving review to DB: {e}")
+            return False
+
+    def _get_review_effect_status(self, review_id: str, review_hash: str, effect: str) -> str:
+        with sqlite3.connect(self.database.db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM review_effects WHERE review_id = ? AND review_hash = ? AND effect = ?",
+                (review_id, review_hash, effect),
+            ).fetchone()
+        return row[0] if row else self.message_manager.PENDING
+
+    def _set_review_effect_status(self, review_id: str, review_hash: str, effect: str, status: str) -> None:
+        if status not in (self.message_manager.PENDING, self.message_manager.COMPLETED,
+                          self.message_manager.PERMANENT_FAILURE):
+            raise ValueError(f"Invalid review effect status: {status}")
+        with sqlite3.connect(self.database.db_path) as conn:
+            conn.execute(
+                "INSERT INTO review_effects (review_id, review_hash, effect, status) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(review_id, review_hash, effect) DO UPDATE SET "
+                "status = excluded.status, updated_at = CURRENT_TIMESTAMP",
+                (review_id, review_hash, effect, status),
+            )
+
+    async def _send_customer_message(self, chat_id: int, text: str, executor=None):
+        """Return delivery result and its failure class from the same worker.
+
+        Capturing last_failure in the worker avoids another concurrent API call
+        overwriting the classification before the state transition is made.
+        """
+        loop = asyncio.get_event_loop()
+        def send():
+            succeeded = self.ggsel_api.send_message(chat_id, text)
+            return succeeded, getattr(self.ggsel_api, "last_failure", None)
+        return await loop.run_in_executor(executor, send)
+
+    @staticmethod
+    def _is_terminal_api_failure(failure) -> bool:
+        value = getattr(failure, "value", failure)
+        return value in ("authentication", "permanent")
 
     def _load_pending_topics(self):
         try:
@@ -218,15 +258,19 @@ class BotService:
     async def check_new_purchases(self):
         if not await self.ensure_ggsel_auth(): return
         loop = asyncio.get_event_loop()
-        try: sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 10)
+        # Use the largest practical API window and always merge durable
+        # pending deliveries, so a transient topic failure cannot age out of
+        # the historical "last 10" window.
+        try: sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 100)
         except Exception as e:
             logging.debug(f"Sales fetch error: {e}")
             return
         
         if not sales_data or sales_data.get('retval') != 0: return
         
-        for sale in sales_data.get('sales', []):
-            invoice_id = sale.get('invoice_id')
+        invoice_ids = [sale.get('invoice_id') for sale in sales_data.get('sales', [])]
+        invoice_ids.extend(self.purchase_manager.get_pending_purchase_ids())
+        for invoice_id in dict.fromkeys(invoice_ids):
             if not invoice_id: continue
             
             if invoice_id in self.failed_topics:
@@ -247,19 +291,16 @@ class BotService:
             purchase_data = await loop.run_in_executor(None, self.ggsel_api.get_purchase_info, invoice_id)
             
             if not purchase_data:
-                dummy = type('Purchase', (), {
-                    'invoice_id': invoice_id, 'buyer_email': '', 'buyer_account': '', 'name': 'Unknown', 'amount': 0, 
-                    'currency_type': 'USD', 'purchase_date': '', 'date_pay': '', 'buyer_phone': '', 'buyer_ip': '', 
-                    'payment_method': '', 'processed_at': datetime.now().isoformat()
-                })()
-                self.purchase_manager.add_purchase(dummy)
-                logging.warning(f"Failed to get info for purchase {invoice_id}, skipping")
+                logging.warning(f"Failed to get info for purchase {invoice_id}, will retry")
                 return
             
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
             if purchase and self.purchase_manager.add_purchase(purchase):
                 logging.info(f"Purchase: {purchase.invoice_id} - {purchase.buyer_email}")
-                await self.create_topic_for_purchase(purchase)
+                delivered = await self.create_topic_for_purchase(purchase)
+                if delivered:
+                    if not self.purchase_manager.mark_purchase_processed(purchase.invoice_id):
+                        logging.error(f"Could not persist delivery state for purchase {purchase.invoice_id}")
         except Exception as e:
             self.failed_topics[invoice_id] = datetime.now()
             logging.error(f"Error processing purchase {invoice_id}: {e}")
@@ -279,17 +320,20 @@ class BotService:
             self.flood_control_until = None
             
             topic_key = f"purchase_{purchase.invoice_id}"
-            if self.topic_manager.get_all_topics().get(topic_key):
-                return
+            existing_topic = self.topic_manager.get_all_topics().get(topic_key)
             
             customer_id = purchase.buyer_email or purchase.buyer_account or f"Customer_{purchase.invoice_id}"
             topic_name = f"💬 {purchase.invoice_id} | {customer_id}"
             
-            await asyncio.sleep(2)
-            topic_id, cooldown = await self.telegram_bot.create_topic(topic_name)
+            if existing_topic:
+                topic_id, cooldown = existing_topic.get('topic_id'), None
+            else:
+                await asyncio.sleep(2)
+                topic_id, cooldown = await self.telegram_bot.create_topic(topic_name)
             
             if topic_id is not None:
-                self.topic_manager.add_topic_for_purchase(purchase, topic_id, topic_name)
+                if not existing_topic:
+                    self.topic_manager.add_topic_for_purchase(purchase, topic_id, topic_name)
                 
                 date_str = ""
                 if purchase.purchase_date:
@@ -354,13 +398,18 @@ class BotService:
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_("btn_go_to_order"), url=order_link)]])
                 
-                await self.send_message_with_cooldown(msg, topic_id, parse_mode="HTML", reply_markup=keyboard)
+                notification_delivered = await self.send_message_with_cooldown(
+                    msg, topic_id, parse_mode="HTML", reply_markup=keyboard,
+                    purchase_invoice_id=purchase.invoice_id,
+                )
+                if not notification_delivered:
+                    return False
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
                 
-                if options_list and not skip_greeting:
+                if options_list and not skip_greeting and not existing_topic:
                     await self.process_csv_rules(purchase.invoice_id, topic_id, options_list)
                 
-                if not skip_greeting and self.autoresponder.should_send_first_message():
+                if not skip_greeting and not existing_topic and self.autoresponder.should_send_first_message():
                     greeting = self.autoresponder.get_first_message_text()
                     if greeting:
                         loop = asyncio.get_event_loop()
@@ -369,6 +418,7 @@ class BotService:
                             await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
                         except Exception as e:
                             logging.error(f"Ошибка отправки приветствия: {e}")
+                return True
                     
             elif cooldown:
                 self.flood_control_until = datetime.now() + timedelta(seconds=cooldown + 5)
@@ -376,10 +426,12 @@ class BotService:
                 self._save_pending_topics()
             else:
                 self.failed_topics[purchase.invoice_id] = datetime.now()
+            return False
                 
         except Exception as e:
             self.failed_topics[purchase.invoice_id] = datetime.now()
             logging.error(f"Ошибка создания топика покупки {purchase.invoice_id}: {e}")
+            return False
     
     async def load_chat_history(self, chat_ids: List[int], topic_id: int, force_reload: bool = False):
         try:
@@ -421,10 +473,15 @@ class BotService:
                 if not force_reload and self.message_manager.is_message_processed(chat_id, message_id): continue
                 
                 message_text = f"📜 {content}" if force_reload else content
-                await self.send_message_with_cooldown(message_text, topic_id, chat_id, message_id)
-                
                 if not force_reload:
-                    await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp)
+                    if not await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp):
+                        continue
+                    # History import mirrors messages but must not trigger a
+                    # fresh customer reply when polling later sees the row.
+                    self.message_manager.set_effect_status(
+                        chat_id, message_id, "autoresponder", self.message_manager.COMPLETED
+                    )
+                await self.send_message_with_cooldown(message_text, topic_id, chat_id, message_id)
                 await asyncio.sleep(0.5)
                 
         except Exception as e: logging.error(f"History load error: {e}")
@@ -448,7 +505,9 @@ class BotService:
                 self.pending_topics.append(data)
                 continue
             
-            await self.create_topic_for_purchase(data['purchase'], skip_greeting=data.get('skip_greeting', False))
+            delivered = await self.create_topic_for_purchase(data['purchase'], skip_greeting=data.get('skip_greeting', False))
+            if delivered:
+                self.purchase_manager.mark_purchase_processed(data['purchase'].invoice_id)
             if self.flood_control_until:
                 remaining_topics = topics[i+1:]
                 for t in remaining_topics:
@@ -535,24 +594,50 @@ class BotService:
             
             if await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp):
                 logging.info(f"New message in chat {chat_id}: {content[:50]}...")
-                await self.send_message_with_cooldown(content, topic_id, chat_id, message_id)
-                
+                if self.message_manager.get_effect_status(chat_id, message_id, "telegram") == self.message_manager.PENDING:
+                    await self.send_message_with_cooldown(content, topic_id, chat_id, message_id)
+
                 try:
                     auto_result = self.autoresponder.find_response(content)
-                    if auto_result:
-                        response_text = auto_result.get("response", "")
-                        notify_group = auto_result.get("notify_group", False)
-                        
+                    response_text = auto_result.get("response", "") if auto_result else ""
+                    notify_group = bool(auto_result and auto_result.get("notify_group", False))
+                    if self.message_manager.get_effect_status(chat_id, message_id, "autoresponder_plan") == self.message_manager.PENDING:
+                        self.message_manager.set_effect_status(
+                            chat_id, message_id, "autoresponder_mirror",
+                            self.message_manager.PENDING if response_text else self.message_manager.COMPLETED,
+                        )
+                        self.message_manager.set_effect_status(
+                            chat_id, message_id, "group_notification",
+                            self.message_manager.PENDING if notify_group else self.message_manager.COMPLETED,
+                        )
+                        self.message_manager.set_effect_status(chat_id, message_id, "autoresponder_plan", self.message_manager.COMPLETED)
+                    customer_status = self.message_manager.get_effect_status(chat_id, message_id, "autoresponder")
+                    if customer_status == self.message_manager.PENDING:
                         if response_text:
-                            loop = asyncio.get_event_loop()
-                            await loop.run_in_executor(None, lambda rt=response_text: self.ggsel_api.send_message(chat_id, rt))
-                            await self.send_message_with_cooldown(response_text, topic_id)
-                        
+                            reply_sent, failure = await self._send_customer_message(chat_id, response_text)
+                            if reply_sent:
+                                self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.COMPLETED)
+                            elif self._is_terminal_api_failure(failure):
+                                self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.PERMANENT_FAILURE)
+                        else:
+                            self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.COMPLETED)
+
+                    customer_status = self.message_manager.get_effect_status(chat_id, message_id, "autoresponder")
+                    mirror_status = self.message_manager.get_effect_status(chat_id, message_id, "autoresponder_mirror")
+                    if mirror_status == self.message_manager.PENDING:
+                        if response_text and customer_status == self.message_manager.COMPLETED:
+                            await self.send_message_with_cooldown(response_text, topic_id, chat_id, message_id, effect="autoresponder_mirror")
+                        elif not response_text or customer_status == self.message_manager.PERMANENT_FAILURE:
+                            self.message_manager.set_effect_status(chat_id, message_id, "autoresponder_mirror", self.message_manager.COMPLETED)
+
+                    if self.message_manager.get_effect_status(chat_id, message_id, "group_notification") == self.message_manager.PENDING:
                         if notify_group:
                             topic_info = next((info for info in self.topic_manager.get_all_topics().values() if info.get('topic_id') == topic_id), None)
                             notify_msg = auto_result.get("notify_text", "") or "🔔 Reply required!"
                             if topic_info: notify_msg += f"\n📧 {topic_info.get('email', 'N/A')}\n🆔 {topic_info.get('invoice_id', 'N/A')}"
-                            await self.send_message_with_cooldown(notify_msg, topic_id)
+                            await self.send_message_with_cooldown(notify_msg, topic_id, chat_id, message_id, effect="group_notification")
+                        else:
+                            self.message_manager.set_effect_status(chat_id, message_id, "group_notification", self.message_manager.COMPLETED)
                 except Exception as e: logging.error(f"Auto-reply error: {e}")
                 return True
             return False
@@ -571,24 +656,28 @@ class BotService:
         await self.telegram_bot.stop()
         logging.info("Bot stopped")
     
-    async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None, parse_mode: str = None, reply_markup = None) -> bool:
+    async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None, parse_mode: str = None, reply_markup = None, purchase_invoice_id: int = None, effect: str = "telegram") -> bool:
         """Updated to support reply_markup for clickable order buttons"""
         try:
-            # SQLite check instead of missing dictionary check
+            # Message ids are scoped to a GGSel chat.
             if chat_id and message_id:
-                if self.message_manager.is_message_processed(chat_id, message_id):
-                    # Check if it was already sent to TG in DB
-                    with __import__('sqlite3').connect(self.database.db_path) as conn:
-                        cur = conn.execute("SELECT is_sent_to_telegram FROM messages WHERE message_id = ?", (message_id,))
-                        row = cur.fetchone()
-                        if row and row[0]: return True
+                if self.message_manager.get_effect_status(chat_id, message_id, effect) in (
+                    self.message_manager.COMPLETED, self.message_manager.PERMANENT_FAILURE
+                ):
+                    return True
 
             if self.message_flood_control_until and datetime.now() < self.message_flood_control_until:
-                self.pending_messages.append({
-                    'text': text, 'topic_id': topic_id, 'chat_id': chat_id, 
-                    'message_id': message_id, 'timestamp': datetime.now(), 
-                    'parse_mode': parse_mode, 'reply_markup': reply_markup
-                })
+                if purchase_invoice_id is None or not any(
+                    queued.get('purchase_invoice_id') == purchase_invoice_id
+                    for queued in self.pending_messages
+                ):
+                    self.pending_messages.append({
+                        'text': text, 'topic_id': topic_id, 'chat_id': chat_id,
+                        'message_id': message_id, 'timestamp': datetime.now(),
+                        'parse_mode': parse_mode, 'reply_markup': reply_markup,
+                        'purchase_invoice_id': purchase_invoice_id,
+                        'effect': effect,
+                    })
                 return False
             self.message_flood_control_until = None
             
@@ -596,16 +685,29 @@ class BotService:
             
             if success:
                 if chat_id and message_id:
-                    self.message_manager.mark_message_sent(chat_id, message_id)
+                    if effect == "telegram": self.message_manager.mark_message_sent(chat_id, message_id)
+                    else: self.message_manager.set_effect_status(chat_id, message_id, effect, self.message_manager.COMPLETED)
                 return True
                 
             elif cooldown:
                 self.message_flood_control_until = datetime.now() + timedelta(seconds=cooldown + 5)
-                self.pending_messages.append({
-                    'text': text, 'topic_id': topic_id, 'chat_id': chat_id, 
-                    'message_id': message_id, 'timestamp': datetime.now(), 
-                    'parse_mode': parse_mode, 'reply_markup': reply_markup
-                })
+                if purchase_invoice_id is None or not any(
+                    queued.get('purchase_invoice_id') == purchase_invoice_id
+                    for queued in self.pending_messages
+                ):
+                    self.pending_messages.append({
+                        'text': text, 'topic_id': topic_id, 'chat_id': chat_id,
+                        'message_id': message_id, 'timestamp': datetime.now(),
+                        'parse_mode': parse_mode, 'reply_markup': reply_markup,
+                        'purchase_invoice_id': purchase_invoice_id,
+                        'effect': effect,
+                    })
+            elif chat_id and message_id:
+                # A non-rate-limit Telegram rejection is terminal. Re-polling
+                # cannot repair it and must not create a hot retry loop.
+                self.message_manager.set_effect_status(
+                    chat_id, message_id, effect, self.message_manager.PERMANENT_FAILURE
+                )
             return False
                 
         except Exception as e:
@@ -622,9 +724,15 @@ class BotService:
         
         for msg in messages:
             success = await self.send_message_with_cooldown(
-                msg['text'], msg['topic_id'], msg.get('chat_id'), 
-                msg.get('message_id'), msg.get('parse_mode'), msg.get('reply_markup')
+                msg['text'], msg['topic_id'], msg.get('chat_id'),
+                msg.get('message_id'), msg.get('parse_mode'), msg.get('reply_markup'),
+                msg.get('purchase_invoice_id'), msg.get('effect', 'telegram')
             )
+            if success and msg.get('purchase_invoice_id') is not None:
+                if not self.purchase_manager.mark_purchase_processed(msg['purchase_invoice_id']):
+                    logging.error(
+                        f"Could not persist queued purchase delivery {msg['purchase_invoice_id']}"
+                    )
             if not success and self.message_flood_control_until: break
             await asyncio.sleep(1)
     
@@ -652,9 +760,6 @@ class BotService:
         if data == "auto_menu": await self.show_auto_menu(chat_id, message_id)
         elif data == "check_balance":
             try:
-                # Answer immediately so the Telegram button loading spinner stops
-                await query.answer()
-                
                 if not await self.ensure_ggsel_auth():
                     await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "❌ Auth Error", None)
                     return
@@ -1057,6 +1162,15 @@ class BotService:
         except Exception as e: logging.error(f"Topic review check error: {e}")
 
     async def _process_reviews(self, reviews: list, invoice_to_topic: dict, loop):
+        # API-wide and per-topic checks run concurrently.  Serialize the
+        # check/side-effect/commit sequence to avoid duplicate review replies.
+        lock = getattr(self, '_review_lock', None)
+        if lock is None:
+            lock = self._review_lock = asyncio.Lock()
+        async with lock:
+            await self._process_reviews_unlocked(reviews, invoice_to_topic, loop)
+
+    async def _process_reviews_unlocked(self, reviews: list, invoice_to_topic: dict, loop):
         for review in reviews:
             review_id = str(review.get('id', ''))
             if not review_id: continue
@@ -1068,8 +1182,6 @@ class BotService:
             old_hash = self.processed_reviews.get(review_id)
             if old_hash == review_hash: continue
             is_updated = old_hash is not None
-            
-            self._save_processed_review_db(review_id, review_hash)
             
             invoice_id = review.get('invoice_id')
             topic_info = invoice_to_topic.get(int(invoice_id)) if invoice_id else None
@@ -1083,14 +1195,42 @@ class BotService:
             if review.get('date'): msg += f"📅 {review['date']}\n"
             if info: msg += f"\n💬 {info}"
             
-            await self.send_message_with_cooldown(msg, topic_id)
-            
+            notification_status = self._get_review_effect_status(review_id, review_hash, "telegram_notification")
+            if notification_status == self.message_manager.PENDING:
+                if await self.send_message_with_cooldown(msg, topic_id):
+                    self._set_review_effect_status(review_id, review_hash, "telegram_notification", self.message_manager.COMPLETED)
+
             auto_response = self.autoresponder.get_review_response(review_type)
-            if auto_response:
+            customer_status = self._get_review_effect_status(review_id, review_hash, "customer_reply")
+            if customer_status == self.message_manager.PENDING:
+                if not auto_response:
+                    self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.COMPLETED)
+                else:
+                    try:
+                        reply_sent, failure = await self._send_customer_message(int(invoice_id), auto_response, _executor)
+                        if reply_sent:
+                            self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.COMPLETED)
+                        elif self._is_terminal_api_failure(failure):
+                            self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.PERMANENT_FAILURE)
+                    except Exception as e:
+                        logging.error(f"Review reply error: {e}")
+
+            customer_status = self._get_review_effect_status(review_id, review_hash, "customer_reply")
+            mirror_status = self._get_review_effect_status(review_id, review_hash, "reply_mirror")
+            if mirror_status == self.message_manager.PENDING:
+                if auto_response and customer_status == self.message_manager.COMPLETED:
+                    if await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id):
+                        self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.COMPLETED)
+                elif not auto_response or customer_status == self.message_manager.PERMANENT_FAILURE:
+                    self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.COMPLETED)
+
+            terminal = (self.message_manager.COMPLETED, self.message_manager.PERMANENT_FAILURE)
+            required = ("telegram_notification", "customer_reply", "reply_mirror")
+            if all(self._get_review_effect_status(review_id, review_hash, effect) in terminal for effect in required):
                 try:
-                    await loop.run_in_executor(_executor, lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt))
-                    await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id)
-                except Exception as e: logging.error(f"Review reply error: {e}")
+                    if self._save_processed_review_db(review_id, review_hash):
+                        self._set_review_effect_status(review_id, review_hash, "db_completion", self.message_manager.COMPLETED)
+                except Exception as e: logging.error(f"Review completion error: {e}")
 
     async def process_pending_history_loads(self):
         if not self.pending_history_loads: return
@@ -1188,7 +1328,6 @@ class BotService:
 
     async def show_balance(self, update, context):
         query = update.callback_query
-        await query.answer()
         try:
             import json, urllib.request
             api = GGSelAPI(self.config)
