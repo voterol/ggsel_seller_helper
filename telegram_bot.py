@@ -45,6 +45,7 @@ class TelegramBot:
             # Use the same configured Bot so polling and ordinary API calls
             # cannot accidentally diverge in their proxy configuration.
             self.application = Application.builder().bot(self.bot).build()
+            self.application.add_handler(CommandHandler(("id", "myid"), self._handle_id_command))
             self.application.add_handler(CommandHandler("menu", self._handle_menu_command))
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))
@@ -114,6 +115,21 @@ class TelegramBot:
         return authorized
 
     # ... keep the rest of the methods exactly as they are ...
+    async def _handle_id_command(self, update: Update, context):
+        """Reveal only the caller's ID, without granting operator access."""
+        chat = getattr(update, 'effective_chat', None)
+        user = getattr(update, 'effective_user', None)
+        message = getattr(update, 'effective_message', None)
+        if (
+            not chat
+            or chat.id != self.group_id
+            or not user
+            or getattr(user, 'is_bot', False)
+            or not message
+        ):
+            return
+        await message.reply_text(f"Your Telegram user ID: {user.id}")
+
     async def _handle_menu_command(self, update: Update, context):
         if not self._is_authorized(update): return
         keyboard = [

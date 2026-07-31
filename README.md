@@ -130,9 +130,12 @@ TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` is a comma- or space-separated allowlist of
-positive personal Telegram user IDs. Startup from `.env` fails with a clear
-error if this setting is missing or empty. Group membership or administrator
-status alone never grants operator access.
+positive personal Telegram user IDs. If this setting is missing or empty, the
+bot starts but denies every operator action. In the configured group, use
+`/id` or `/myid` to display your personal numeric ID, then add it to the
+allowlist and restart the bot. These commands only display an ID and never
+grant access. Group membership or administrator status alone never grants
+operator access.
 
 `TELEGRAM_PROXY_URL` is optional, so existing `.env` files continue to work.
 Only `http://` and `socks5://` URLs with an explicit host and port are accepted.
@@ -168,6 +171,7 @@ python main.py
 | Command    | Where to use | Description                      |
 | ---------- | ------------ | -------------------------------- |
 | `/menu`    | In group     | Main menu |
+| `/id`, `/myid` | In group | Show your personal Telegram user ID |
 | `/history` | In topic     | Load message history             |
 | `/options` | In topic     | Show purchase options            |
 

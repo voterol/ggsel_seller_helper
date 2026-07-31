@@ -81,6 +81,7 @@ def make_config(**overrides):
 
 
 def make_update(user_id=42, chat_id=-1001, data="action"):
+    message = SimpleNamespace(reply_text=AsyncMock())
     query = SimpleNamespace(
         data=data,
         answer=AsyncMock(),
@@ -89,6 +90,8 @@ def make_update(user_id=42, chat_id=-1001, data="action"):
     return SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
         effective_chat=SimpleNamespace(id=chat_id),
+        effective_message=message,
+        message=message,
         callback_query=query,
     )
 
@@ -114,6 +117,29 @@ class ConfigTests(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=True):
             self.assertIsNone(Config.from_env().telegram_proxy_url)
+
+    def test_missing_or_blank_allowlist_starts_deny_by_default(self):
+        base_env = {
+            "GGSEL_SELLER_ID": "1",
+            "GGSEL_API_KEY": "key",
+            "TELEGRAM_BOT_TOKEN": "123:token",
+            "TELEGRAM_GROUP_ID": "-1001",
+        }
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                env = dict(base_env)
+                if value is not None:
+                    env["TELEGRAM_ALLOWED_USER_IDS"] = value
+                with patch.dict(os.environ, env, clear=True):
+                    config = Config.from_env()
+                self.assertEqual(config.telegram_allowed_user_ids, frozenset())
+
+    def test_non_positive_allowed_ids_are_rejected(self):
+        for value in ("0", "-1", "42,-1"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "TELEGRAM_ALLOWED_USER_IDS"
+            ):
+                Config._allowed_user_ids(value)
 
     def test_http_and_socks5_proxy_urls_are_accepted(self):
         for value in (
@@ -182,6 +208,56 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot.start())
 
         builder.bot.assert_called_once_with(bot.bot)
+
+    def test_id_aliases_are_registered(self):
+        bot = TelegramBot(make_config())
+        builder = unittest.mock.Mock()
+        application = SimpleNamespace(
+            add_handler=lambda _handler: None,
+            initialize=AsyncMock(),
+            start=AsyncMock(),
+            updater=SimpleNamespace(start_polling=AsyncMock()),
+        )
+        builder.bot.return_value = builder
+        builder.build.return_value = application
+        commands = []
+
+        def command_handler(command, callback):
+            commands.append((command, callback))
+            return object()
+
+        with patch("telegram_bot.Application", SimpleNamespace(builder=lambda: builder)), patch(
+            "telegram_bot.CommandHandler", side_effect=command_handler
+        ), patch("telegram_bot.CallbackQueryHandler", return_value=object()):
+            asyncio.run(bot.start())
+
+        self.assertIn(("id", "myid"), [command for command, _callback in commands])
+
+    def test_id_command_reports_caller_in_configured_group_without_authorizing(self):
+        bot = TelegramBot(make_config(telegram_allowed_user_ids=frozenset()))
+        update = make_update(user_id=77)
+
+        asyncio.run(bot._handle_id_command(update, None))
+
+        update.effective_message.reply_text.assert_awaited_once_with(
+            "Your Telegram user ID: 77"
+        )
+        self.assertEqual(bot.allowed_user_ids, frozenset())
+        self.assertFalse(bot._is_authorized(update))
+
+    def test_id_command_ignores_other_chats_and_missing_or_bot_users(self):
+        bot = TelegramBot(make_config(telegram_allowed_user_ids=frozenset()))
+        updates = [
+            make_update(chat_id=-2002),
+            make_update(),
+            make_update(),
+        ]
+        updates[1].effective_user = None
+        updates[2].effective_user.is_bot = True
+
+        for update in updates:
+            asyncio.run(bot._handle_id_command(update, None))
+            update.effective_message.reply_text.assert_not_awaited()
 
     def test_callback_is_denied_by_default_even_in_allowed_group(self):
         bot = TelegramBot(make_config(telegram_allowed_user_ids=frozenset()))
