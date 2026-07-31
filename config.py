@@ -167,10 +167,5 @@ class Config:
             retry_delay=int(os.getenv('RETRY_DELAY', '5')),
             auto_update=os.getenv('AUTO_UPDATE', 'true').lower() in ('true', '1', 'yes')
         )
-        if not config.telegram_allowed_user_ids:
-            raise ValueError(
-                "Missing required configuration: TELEGRAM_ALLOWED_USER_IDS "
-                "(at least one positive personal Telegram user ID)"
-            )
         config.validate()
         return config
