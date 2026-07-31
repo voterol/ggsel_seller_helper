@@ -4,13 +4,20 @@ from typing import Optional, Tuple
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.request import HTTPXRequest
 from config import Config
 from locales import locales, _ 
 
 class TelegramBot:
     def __init__(self, config: Config):
         self.config = config
-        self.bot = Bot(token=config.telegram_bot_token)
+        bot_options = {}
+        if config.telegram_proxy_url:
+            # Separate request objects are required by PTB: getUpdates uses a
+            # dedicated client while all other Bot API calls use `request`.
+            bot_options["request"] = HTTPXRequest(proxy=config.telegram_proxy_url)
+            bot_options["get_updates_request"] = HTTPXRequest(proxy=config.telegram_proxy_url)
+        self.bot = Bot(token=config.telegram_bot_token, **bot_options)
         self.group_id = config.telegram_group_id
         self.allowed_user_ids = frozenset(getattr(config, 'telegram_allowed_user_ids', frozenset()))
         self.application = None
@@ -35,7 +42,9 @@ class TelegramBot:
                 "TELEGRAM_ALLOWED_USER_IDS is empty; all Telegram operator actions will be denied"
             )
         try:
-            self.application = Application.builder().token(self.config.telegram_bot_token).build()
+            # Use the same configured Bot so polling and ordinary API calls
+            # cannot accidentally diverge in their proxy configuration.
+            self.application = Application.builder().bot(self.bot).build()
             self.application.add_handler(CommandHandler("menu", self._handle_menu_command))
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))

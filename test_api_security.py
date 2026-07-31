@@ -72,16 +72,34 @@ class GGSelAPISecurityTests(unittest.TestCase):
         self.assertNotIn("secret-token", url)
         self.assertEqual(api.session.request.call_args.kwargs["params"]["token"], "secret-token")
 
-    def test_send_requires_documented_json_success(self):
+    def test_send_uses_documented_http_success(self):
         api = GGSelAPI(make_config())
         api.token = "opaque"
         api.session.request = Mock(return_value=response(payload=ValueError("not json")))
-        self.assertFalse(api.send_message(7, "hello"))
-        self.assertEqual(api.last_failure, APIFailure.PERMANENT)
+        self.assertTrue(api.send_message(7, "hello"))
+        self.assertIsNone(api.last_failure)
 
         api.session.request.return_value = response(payload={"retval": 0})
         self.assertTrue(api.send_message(7, "hello"))
         self.assertIsNone(api.last_failure)
+
+    def test_purchase_info_sends_required_locale_header(self):
+        api = GGSelAPI(make_config())
+        api.token = "opaque"
+        api.session.request = Mock(return_value=response(payload={"retval": 0, "content": {}}))
+
+        self.assertIsNotNone(api.get_purchase_info(42))
+        self.assertEqual(api.session.request.call_args.kwargs["headers"]["locale"], "ru")
+
+    def test_balance_token_is_sent_as_parameter_not_url_text(self):
+        api = GGSelAPI(make_config())
+        api.token = "secret-token"
+        api.session.request = Mock(return_value=response(payload={"retval": 0, "content": {}}))
+
+        self.assertIsNotNone(api.get_balance_info())
+        _, url = api.session.request.call_args.args
+        self.assertNotIn("secret-token", url)
+        self.assertEqual(api.session.request.call_args.kwargs["params"]["token"], "secret-token")
 
     def test_transport_and_status_failures_are_classified(self):
         api = GGSelAPI(make_config())
