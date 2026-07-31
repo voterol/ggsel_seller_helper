@@ -1,0 +1,95 @@
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from bot_service import BotService
+from config import Config
+from database import Database
+
+
+def make_config(database_path):
+    return Config(
+        ggsel_seller_id=1,
+        ggsel_api_key="key",
+        telegram_bot_token="123:token",
+        telegram_group_id=-1001,
+        telegram_allowed_user_ids=frozenset({42}),
+        database_path=database_path,
+    )
+
+
+class SyncControlTests(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.addCleanup(self.loop.close)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = str(Path(self.temp.name) / "state.db")
+
+    def make_service(self):
+        with patch("bot_service.GGSelAPI", return_value=Mock()), patch(
+            "bot_service.TelegramBot", return_value=Mock()
+        ):
+            return BotService(make_config(self.path))
+
+    def test_sync_defaults_enabled_and_stop_state_survives_restart(self):
+        service = self.make_service()
+        self.assertTrue(service.sync_enabled)
+
+        self.assertIn("stopped", self.loop.run_until_complete(service.pause_sync()))
+        self.assertFalse(service.sync_enabled)
+        self.assertEqual(Database(self.path).get_setting("ggsel_sync_enabled"), "false")
+
+        restarted = self.make_service()
+        self.assertFalse(restarted.sync_enabled)
+        self.assertIn("already stopped", self.loop.run_until_complete(restarted.pause_sync()))
+
+    def test_start_is_idempotent_and_persisted(self):
+        service = self.make_service()
+        self.loop.run_until_complete(service.pause_sync())
+
+        with patch.object(service, "_background_boot_sequence", new=AsyncMock()):
+            self.assertIn("started", self.loop.run_until_complete(service.start_sync()))
+            self.assertIn("already running", self.loop.run_until_complete(service.start_sync()))
+
+        self.assertTrue(service.sync_enabled)
+        self.assertEqual(Database(self.path).get_setting("ggsel_sync_enabled"), "true")
+
+    def test_stopped_mode_blocks_customer_writes(self):
+        service = self.make_service()
+        self.loop.run_until_complete(service.pause_sync())
+
+        result = self.loop.run_until_complete(service._send_customer_message(123, "hello"))
+
+        self.assertEqual(result, (False, None))
+        service.ggsel_api.send_message.assert_not_called()
+
+    def test_stop_waits_for_admitted_customer_write(self):
+        service = self.make_service()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def scenario():
+            async def admitted_write():
+                async with service._customer_write_lock:
+                    entered.set()
+                    await release.wait()
+
+            write_task = asyncio.create_task(admitted_write())
+            await entered.wait()
+            stop_task = asyncio.create_task(service.pause_sync())
+            await asyncio.sleep(0)
+            self.assertFalse(stop_task.done())
+            release.set()
+            await write_task
+            self.assertIn("stopped", await stop_task)
+
+        self.loop.run_until_complete(scenario())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 # Keep focused tests runnable when the optional Telegram dependency is absent.
 try:
@@ -232,6 +232,29 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot.start())
 
         self.assertIn(("id", "myid"), [command for command, _callback in commands])
+        self.assertIn("start_sync", [command for command, _callback in commands])
+        self.assertIn("stop_sync", [command for command, _callback in commands])
+
+    def test_sync_commands_require_authorization_and_delegate(self):
+        bot = TelegramBot(make_config())
+        bot.start_sync_handler = AsyncMock(return_value="started")
+        bot.stop_sync_handler = AsyncMock(return_value="stopped")
+        authorized = make_update()
+
+        asyncio.run(bot._handle_start_sync_command(authorized, None))
+        asyncio.run(bot._handle_stop_sync_command(authorized, None))
+
+        bot.start_sync_handler.assert_awaited_once_with()
+        bot.stop_sync_handler.assert_awaited_once_with()
+        self.assertEqual(
+            [call.args[0] for call in authorized.effective_message.reply_text.await_args_list],
+            ["started", "stopped"],
+        )
+
+        unauthorized = make_update(user_id=99)
+        asyncio.run(bot._handle_start_sync_command(unauthorized, None))
+        asyncio.run(bot._handle_stop_sync_command(unauthorized, None))
+        unauthorized.effective_message.reply_text.assert_not_awaited()
 
     def test_id_command_reports_caller_in_configured_group_without_authorizing(self):
         bot = TelegramBot(make_config(telegram_allowed_user_ids=frozenset()))

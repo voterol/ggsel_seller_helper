@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 @dataclass
@@ -70,6 +70,12 @@ class Database:
         conn.execute('CREATE TABLE IF NOT EXISTS purchases (invoice_id TEXT PRIMARY KEY, data TEXT)')
         conn.execute('CREATE TABLE IF NOT EXISTS processed_reviews (review_id TEXT PRIMARY KEY, hash TEXT)')
         conn.execute('CREATE TABLE IF NOT EXISTS pending_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS service_settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         conn.execute('''
             CREATE TABLE IF NOT EXISTS message_effects (
                 chat_id INTEGER NOT NULL, message_id TEXT NOT NULL,
@@ -156,6 +162,22 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('INSERT OR REPLACE INTO chats (id_i, email, product, last_message, cnt_msg, cnt_new, telegram_topic_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
                          (chat.id_i, chat.email, chat.product, chat.last_message, chat.cnt_msg, chat.cnt_new, chat.telegram_topic_id))
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                'SELECT value FROM service_settings WHERE key = ?', (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'INSERT INTO service_settings (key, value) VALUES (?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value, '
+                'updated_at = CURRENT_TIMESTAMP',
+                (key, value),
+            )
 
     def get_chat(self, chat_id: int) -> Optional[Chat]:
         with sqlite3.connect(self.db_path) as conn:

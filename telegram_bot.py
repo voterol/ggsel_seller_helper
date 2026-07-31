@@ -26,7 +26,9 @@ class TelegramBot:
         self.general_message_handler = None
         self.history_handler = None 
         self.options_handler = None 
-        self.review_handler = None 
+        self.review_handler = None
+        self.start_sync_handler = None
+        self.stop_sync_handler = None
         
     def set_topic_message_handler(self, h): self.topic_message_handler = h
     def set_callback_handler(self, h): self.callback_handler = h
@@ -34,6 +36,8 @@ class TelegramBot:
     def set_history_handler(self, h): self.history_handler = h
     def set_options_handler(self, h): self.options_handler = h
     def set_review_handler(self, h): self.review_handler = h
+    def set_start_sync_handler(self, h): self.start_sync_handler = h
+    def set_stop_sync_handler(self, h): self.stop_sync_handler = h
 
     async def start(self):
         self.config.validate()
@@ -46,6 +50,8 @@ class TelegramBot:
             # cannot accidentally diverge in their proxy configuration.
             self.application = Application.builder().bot(self.bot).build()
             self.application.add_handler(CommandHandler(("id", "myid"), self._handle_id_command))
+            self.application.add_handler(CommandHandler("start_sync", self._handle_start_sync_command))
+            self.application.add_handler(CommandHandler("stop_sync", self._handle_stop_sync_command))
             self.application.add_handler(CommandHandler("menu", self._handle_menu_command))
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))
@@ -129,6 +135,18 @@ class TelegramBot:
         ):
             return
         await message.reply_text(f"Your Telegram user ID: {user.id}")
+
+    async def _handle_start_sync_command(self, update: Update, context):
+        if not self._is_authorized(update) or not self.start_sync_handler:
+            return
+        text = await self.start_sync_handler()
+        await update.effective_message.reply_text(text)
+
+    async def _handle_stop_sync_command(self, update: Update, context):
+        if not self._is_authorized(update) or not self.stop_sync_handler:
+            return
+        text = await self.stop_sync_handler()
+        await update.effective_message.reply_text(text)
 
     async def _handle_menu_command(self, update: Update, context):
         if not self._is_authorized(update): return

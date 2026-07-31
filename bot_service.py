@@ -45,6 +45,13 @@ class BotService:
         self.awaiting_input = {}
         self.processed_reviews = {}
         self._review_lock = asyncio.Lock()
+        self._sync_transition_lock = asyncio.Lock()
+        self._sync_operation_lock = asyncio.Lock()
+        self._customer_write_lock = asyncio.Lock()
+        self.sync_enabled = self.database.get_setting("ggsel_sync_enabled") != "false"
+        self._sync_enabled_event = asyncio.Event()
+        if self.sync_enabled:
+            self._sync_enabled_event.set()
         self.failed_topics = {}
         self.chat_locks = {}
         
@@ -108,16 +115,26 @@ class BotService:
         Capturing last_failure in the worker avoids another concurrent API call
         overwriting the classification before the state transition is made.
         """
-        loop = asyncio.get_event_loop()
-        def send():
-            succeeded = self.ggsel_api.send_message(chat_id, text)
-            return succeeded, getattr(self.ggsel_api, "last_failure", None)
-        return await loop.run_in_executor(executor, send)
+        if not hasattr(self, '_customer_write_lock'):
+            self._customer_write_lock = asyncio.Lock()
+        async with self._customer_write_lock:
+            if not getattr(self, 'sync_enabled', True):
+                return False, None
+            loop = asyncio.get_event_loop()
+            def send():
+                succeeded = self.ggsel_api.send_message(chat_id, text)
+                return succeeded, getattr(self.ggsel_api, "last_failure", None)
+            return await loop.run_in_executor(executor, send)
 
     @staticmethod
     def _is_terminal_api_failure(failure) -> bool:
         value = getattr(failure, "value", failure)
         return value in ("authentication", "permanent")
+
+    async def _run_sync_operation(self, operation):
+        async with self._sync_operation_lock:
+            if self.running and self.sync_enabled:
+                await operation()
 
     def _load_pending_topics(self):
         try:
@@ -160,6 +177,8 @@ class BotService:
         self.telegram_bot.set_history_handler(self.handle_history_command)
         self.telegram_bot.set_options_handler(self.handle_options_command)
         self.telegram_bot.set_review_handler(self.handle_review_command)
+        self.telegram_bot.set_start_sync_handler(self.start_sync)
+        self.telegram_bot.set_stop_sync_handler(self.pause_sync)
         
         await self.telegram_bot.start()
         self.running = True
@@ -186,9 +205,13 @@ class BotService:
 
     async def _background_boot_sequence(self):
         """Background tasks loaded safely without blocking Telegram UI"""
-        if not await self.ensure_ggsel_auth(): return
-        await self.test_reviews_api()
-        await self.process_pending_topics()
+        await self._sync_enabled_event.wait()
+        if not self.running or not self.sync_enabled: return
+        async with self._sync_operation_lock:
+            if not self.running or not self.sync_enabled: return
+            if not await self.ensure_ggsel_auth(): return
+            await self.test_reviews_api()
+            await self.process_pending_topics()
     
     async def test_reviews_api(self):
         try:
@@ -224,9 +247,8 @@ class BotService:
                 await self.send_message_with_cooldown("⚠️ No invoice_id", topic_id)
                 return
             
-            loop = asyncio.get_event_loop()
             try:
-                result = await loop.run_in_executor(None, lambda: self.ggsel_api.send_message(invoice_id, message_text))
+                result, _failure = await self._send_customer_message(invoice_id, message_text)
                 if result:
                     await self.telegram_bot.add_reaction(message_id, topic_id, "🔥")
                 else:
@@ -239,6 +261,8 @@ class BotService:
             logging.error(f"Error processing message: {e}")
     
     async def ensure_ggsel_auth(self) -> bool:
+        if not getattr(self, 'sync_enabled', True):
+            return False
         current_time = datetime.now()
         if self.last_auth_time and current_time - self.last_auth_time < timedelta(seconds=self.auth_interval):
             return True
@@ -251,11 +275,17 @@ class BotService:
     
     async def purchase_checker(self):
         while self.running:
-            try: await self.check_new_purchases()
+            await self._sync_enabled_event.wait()
+            if not self.running: break
+            try:
+                async with self._sync_operation_lock:
+                    if self.running and self.sync_enabled:
+                        await self.check_new_purchases()
             except Exception as e: logging.error(f"Purchase check error: {e}")
             await asyncio.sleep(30)
     
     async def check_new_purchases(self):
+        if not getattr(self, 'sync_enabled', True): return
         if not await self.ensure_ggsel_auth(): return
         loop = asyncio.get_event_loop()
         # Use the largest practical API window and always merge durable
@@ -414,7 +444,7 @@ class BotService:
                     if greeting:
                         loop = asyncio.get_event_loop()
                         try:
-                            await loop.run_in_executor(None, lambda cid=purchase.invoice_id, g=greeting: self.ggsel_api.send_message(cid, g))
+                            await self._send_customer_message(purchase.invoice_id, greeting)
                             await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
                         except Exception as e:
                             logging.error(f"Ошибка отправки приветствия: {e}")
@@ -448,7 +478,7 @@ class BotService:
                 greeting = self.autoresponder.get_first_message_text()
                 if greeting and chat_ids:
                     for chat_id in chat_ids:
-                        await loop.run_in_executor(None, lambda cid=chat_id, g=greeting: self.ggsel_api.send_message(cid, g))
+                        await self._send_customer_message(chat_id, greeting)
                     await self.send_message_with_cooldown(greeting, topic_id)
                 return
             
@@ -522,32 +552,38 @@ class BotService:
         logging.info("Starting message monitor")
         sync_counter = 0
         review_counter = 0
-        asyncio.create_task(self.sync_topics_with_purchases())
-        asyncio.create_task(self.check_new_reviews())
+        if self.sync_enabled:
+            asyncio.create_task(self._run_sync_operation(self.sync_topics_with_purchases))
+            asyncio.create_task(self._run_sync_operation(self.check_new_reviews))
         
         while self.running:
+            await self._sync_enabled_event.wait()
+            if not self.running: break
             try:
-                await self.process_pending_messages()
-                await self.process_pending_topics()
-                
-                if not await self.ensure_ggsel_auth():
-                    await asyncio.sleep(2)
-                    continue
-                
-                all_topics = self.topic_manager.get_all_topics()
-                purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
-                if purchase_topics: await self.check_topics_parallel(purchase_topics)
-                
-                review_counter += 1
-                if review_counter >= 3:
-                    review_counter = 0
-                    asyncio.create_task(self.check_new_reviews())
-                
-                sync_counter += 1
-                if sync_counter >= 43200:
-                    sync_counter = 0
-                    asyncio.create_task(self.sync_topics_with_purchases())
-                    
+                async with self._sync_operation_lock:
+                    if not self.running or not self.sync_enabled:
+                        continue
+                    await self.process_pending_messages()
+                    await self.process_pending_topics()
+
+                    if not await self.ensure_ggsel_auth():
+                        await asyncio.sleep(2)
+                        continue
+
+                    all_topics = self.topic_manager.get_all_topics()
+                    purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
+                    if purchase_topics: await self.check_topics_parallel(purchase_topics)
+
+                    review_counter += 1
+                    if review_counter >= 3:
+                        review_counter = 0
+                        asyncio.create_task(self._run_sync_operation(self.check_new_reviews))
+
+                    sync_counter += 1
+                    if sync_counter >= 43200:
+                        sync_counter = 0
+                        asyncio.create_task(self._run_sync_operation(self.sync_topics_with_purchases))
+
             except Exception as e: logging.error(f"Monitor error: {e}")
             await asyncio.sleep(2)
     
@@ -569,6 +605,7 @@ class BotService:
             except Exception as e: logging.error(f"Chat check error {chat_id}: {e}")
     
     async def check_chat_messages(self, chat_id: int, topic_id: int) -> bool:
+        if not getattr(self, 'sync_enabled', True): return False
         try:
             loop = asyncio.get_event_loop()
             messages_data = await loop.run_in_executor(_executor, self.ggsel_api.get_chat_messages, chat_id)
@@ -646,9 +683,9 @@ class BotService:
             return False
     
     async def stop(self):
-        if not self.running: return
         logging.info("Stopping bot...")
         self.running = False
+        self._sync_enabled_event.set()
         current_task = asyncio.current_task()
         tasks = [t for t in asyncio.all_tasks() if t is not current_task and not t.done()]
         for task in tasks: task.cancel()
@@ -743,10 +780,44 @@ class BotService:
     async def reauth_scheduler(self):
         while self.running:
             await asyncio.sleep(self.auth_interval)
-            if self.running: await self.ensure_ggsel_auth()
+            if self.running and self.sync_enabled:
+                async with self._sync_operation_lock:
+                    if self.running and self.sync_enabled:
+                        await self.ensure_ggsel_auth()
     
+    async def start_sync(self) -> str:
+        async with self._sync_transition_lock:
+            if self.sync_enabled:
+                return "✅ Synchronization is already running."
+            self.database.set_setting("ggsel_sync_enabled", "true")
+            self.sync_enabled = True
+            self._sync_enabled_event.set()
+            if self.running:
+                asyncio.create_task(self._background_boot_sequence())
+                asyncio.create_task(self._run_sync_operation(self.sync_topics_with_purchases))
+                asyncio.create_task(self._run_sync_operation(self.check_new_reviews))
+            logging.info("GGSel synchronization started by an operator")
+            return "▶️ GGSel synchronization started."
+
+    async def pause_sync(self) -> str:
+        async with self._sync_transition_lock:
+            if not self.sync_enabled:
+                return "⏸ GGSel synchronization is already stopped."
+            # Close admission, then wait for admitted sync work and customer
+            # writes before acknowledging the pause.
+            self.database.set_setting("ggsel_sync_enabled", "false")
+            self.sync_enabled = False
+            self._sync_enabled_event.clear()
+            async with self._sync_operation_lock:
+                async with self._customer_write_lock:
+                    pass
+            logging.info("GGSel synchronization stopped by an operator")
+            return "⏸ GGSel synchronization stopped. The Telegram bot remains online."
+
     def stop_sync(self):
+        """Stop the whole service; retained for the process signal handler."""
         self.running = False
+        self._sync_enabled_event.set()
 
     def _safe_parse_idx(self, data: str, prefix: str) -> int:
         try: return int(data.replace(prefix, ""))
@@ -1071,6 +1142,7 @@ class BotService:
         return False
 
     async def sync_topics_with_purchases(self):
+        if not getattr(self, 'sync_enabled', True): return
         logging.info("Starting topic sync with purchases...")
         if not await self.ensure_ggsel_auth(): return
         await self.check_deleted_topics()
@@ -1120,6 +1192,7 @@ class BotService:
             await asyncio.sleep(0.5)
     
     async def check_new_reviews(self):
+        if not getattr(self, 'sync_enabled', True): return
         try:
             loop = asyncio.get_event_loop()
             invoice_to_topic = {int(info['invoice_id']): info for k, info in self.topic_manager.get_all_topics().items() if k.startswith('purchase_') and info.get('invoice_id')}
@@ -1279,7 +1352,7 @@ class BotService:
                 if result.get("send_to_user") and result.get("user_message"):
                     user_msg = result["user_message"].replace("{option}", option_name).replace("{value}", option_value).replace("{sum}", option_value)
                     try:
-                        await loop.run_in_executor(None, lambda cid=invoice_id, msg=user_msg: self.ggsel_api.send_message(cid, msg))
+                        await self._send_customer_message(invoice_id, user_msg)
                         await self.send_message_with_cooldown(f"📤 {user_msg}", topic_id)
                     except Exception as e: logging.error(f"CSV User msg error: {e}")
         except Exception as e: logging.error(f"CSV process error: {e}")
@@ -1346,46 +1419,51 @@ class BotService:
         import httpx
         
         while self.running:
-            await asyncio.sleep(60) 
+            await self._sync_enabled_event.wait()
+            if not self.running: break
+            await asyncio.sleep(60)
             try:
-                if not await self.ensure_ggsel_auth():
-                    continue
-                    
-                loop = asyncio.get_event_loop()
-                res_data = await loop.run_in_executor(None, self.ggsel_api.get_balance_info)
-                if not res_data:
-                    continue
-                    
-                content = res_data.get("content", {})
-                current_avail = float(content.get("amount_t_free") or 0.0)
-                current_hold = float(content.get("amount_t_lock") or 0.0)
-                current_total = current_avail + current_hold
-                
-                if self.last_available_balance is None:
-                    self.last_available_balance = current_avail
-                    continue
-                
-                if current_avail != self.last_available_balance:
-                    diff = current_avail - self.last_available_balance
-                    current_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-                    
-                    if diff > 0:
-                        header = f"📈 **BALANCE INCREASE**\n🟢 **+{diff:.2f} USD**"
-                    else:
-                        header = f"📉 **BALANCE DECREASE**\n🔴 **{diff:.2f} USD**"
-                    
-                    alert = (
-                        f"{header}\n"
-                        f"💰 **Current balance:**\n"
-                        f"• Available: `{current_avail:.2f} USD`\n"
-                        f"• Blocked: `{current_hold:.2f} USD`\n"
-                        f"• Total: `{current_total:.2f} USD`\n"
-                        f"📊 Previous balance: `{self.last_available_balance:.2f} USD`\n"
-                        f"🕒 Time: `{current_time}`"
-                    )
-                    
-                    await self.telegram_bot.send_message(alert, -1, parse_mode="Markdown")
-                    self.last_available_balance = current_avail
+                async with self._sync_operation_lock:
+                    if not self.running or not self.sync_enabled:
+                        continue
+                    if not await self.ensure_ggsel_auth():
+                        continue
+
+                    loop = asyncio.get_event_loop()
+                    res_data = await loop.run_in_executor(None, self.ggsel_api.get_balance_info)
+                    if not res_data:
+                        continue
+
+                    content = res_data.get("content", {})
+                    current_avail = float(content.get("amount_t_free") or 0.0)
+                    current_hold = float(content.get("amount_t_lock") or 0.0)
+                    current_total = current_avail + current_hold
+
+                    if self.last_available_balance is None:
+                        self.last_available_balance = current_avail
+                        continue
+
+                    if current_avail != self.last_available_balance:
+                        diff = current_avail - self.last_available_balance
+                        current_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+                        if diff > 0:
+                            header = f"📈 **BALANCE INCREASE**\n🟢 **+{diff:.2f} USD**"
+                        else:
+                            header = f"📉 **BALANCE DECREASE**\n🔴 **{diff:.2f} USD**"
+
+                        alert = (
+                            f"{header}\n"
+                            f"💰 **Current balance:**\n"
+                            f"• Available: `{current_avail:.2f} USD`\n"
+                            f"• Blocked: `{current_hold:.2f} USD`\n"
+                            f"• Total: `{current_total:.2f} USD`\n"
+                            f"📊 Previous balance: `{self.last_available_balance:.2f} USD`\n"
+                            f"🕒 Time: `{current_time}`"
+                        )
+
+                        await self.telegram_bot.send_message(alert, -1, parse_mode="Markdown")
+                        self.last_available_balance = current_avail
                 
             except Exception:
                 # Silently pass connection drops so it doesn't spam the logs
