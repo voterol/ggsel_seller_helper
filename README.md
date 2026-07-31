@@ -98,6 +98,18 @@ pip install -r requirements.txt
 
 ### 4. Create the .env file
 
+For a new installation, use the interactive setup. It asks for the required
+GGSel and Telegram values, a non-empty operator allowlist, and an optional HTTP
+or SOCKS5 proxy. Secret values and proxy passwords are entered without echo.
+The resulting file is replaced atomically with mode `0600`; an existing `.env`
+is not replaced without explicit confirmation.
+
+```bash
+python setup.py
+```
+
+Alternatively, create it manually:
+
 ```bash
 cp .env.example .env
 ```
@@ -113,12 +125,20 @@ GGSEL_API_KEY=your_api_key_here
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 TELEGRAM_GROUP_ID=-1001234567890
 TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+# Optional; omit for a direct connection:
+# TELEGRAM_PROXY_URL=socks5://username:password@127.0.0.1:1080
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` is a comma- or space-separated allowlist of
-positive Telegram user IDs. Bot commands, callbacks, and topic replies are
-denied by default: if this setting is missing or empty, no user is authorized,
-even if they are a member or administrator of the configured group.
+positive personal Telegram user IDs. Startup from `.env` fails with a clear
+error if this setting is missing or empty. Group membership or administrator
+status alone never grants operator access.
+
+`TELEGRAM_PROXY_URL` is optional, so existing `.env` files continue to work.
+Only `http://` and `socks5://` URLs with an explicit host and port are accepted.
+When set, the proxy is used for both polling (`getUpdates`) and all other Bot
+API calls. Percent-encode special characters in credentials and never put the
+URL in logs or support messages because it may contain a password.
 
 ### 5. Настройте Telegram
 

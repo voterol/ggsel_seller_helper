@@ -131,6 +131,30 @@ class BotServiceReliabilityTests(unittest.TestCase):
 
         service.purchase_manager.mark_purchase_processed.assert_called_once_with(42)
 
+    def test_rate_limited_queue_preserves_unprocessed_tail(self):
+        service = object.__new__(BotService)
+        service.pending_messages = [
+            {"text": "first", "topic_id": 1},
+            {"text": "second", "topic_id": 2},
+        ]
+        service.message_flood_control_until = None
+
+        async def rate_limited(*args, **kwargs):
+            from datetime import timedelta
+            service.message_flood_control_until = datetime.now() + timedelta(seconds=60)
+            service.pending_messages.append({"text": "first", "topic_id": 1})
+            return False
+
+        service.send_message_with_cooldown = AsyncMock(side_effect=rate_limited)
+        service.purchase_manager = Mock()
+
+        asyncio.run(service.process_pending_messages())
+
+        self.assertEqual(
+            [item["text"] for item in service.pending_messages],
+            ["first", "second"],
+        )
+
     def test_existing_purchase_topic_retries_required_notification(self):
         service = object.__new__(BotService)
         service.failed_topics = {}

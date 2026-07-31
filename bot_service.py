@@ -344,7 +344,7 @@ class BotService:
                         date_str = purchase.purchase_date
                 
                 # --- EXACT LAYOUT REPLICATION (NO DOUBLE EMOJIS) ---
-                order_link = f"https://seller.ggsel.net/orders/{purchase.invoice_id}"
+                order_link = f"https://seller.ggsel.com/orders/{purchase.invoice_id}"
                 header = _('noti_restored') if skip_greeting else _('noti_new_purchase')
                 
                 msg = f"{header}\n\n"
@@ -455,7 +455,7 @@ class BotService:
             if not all_messages: return
             
             def get_timestamp(msg):
-                ts = msg.get('timestamp', msg.get('created_at', msg.get('date', msg.get('time', ''))))
+                ts = msg.get('date_written', msg.get('timestamp', msg.get('created_at', msg.get('date', msg.get('time', '')))))
                 if not ts: return datetime.min
                 try: return datetime.fromisoformat(str(ts).replace('Z', '+00:00').replace('+03:00', ''))
                 except: return datetime.min
@@ -585,7 +585,7 @@ class BotService:
         try:
             message_id = str(msg_data.get('id', ''))
             content = msg_data.get('message', msg_data.get('text', msg_data.get('content', '')))
-            timestamp_str = msg_data.get('timestamp', msg_data.get('created_at', ''))
+            timestamp_str = msg_data.get('date_written', msg_data.get('timestamp', msg_data.get('created_at', '')))
             if not message_id or not content: return False
             if self.message_manager.is_message_processed(chat_id, message_id): return False
             
@@ -722,7 +722,7 @@ class BotService:
         messages = self.pending_messages.copy()
         self.pending_messages.clear()
         
-        for msg in messages:
+        for index, msg in enumerate(messages):
             success = await self.send_message_with_cooldown(
                 msg['text'], msg['topic_id'], msg.get('chat_id'),
                 msg.get('message_id'), msg.get('parse_mode'), msg.get('reply_markup'),
@@ -733,7 +733,11 @@ class BotService:
                     logging.error(
                         f"Could not persist queued purchase delivery {msg['purchase_invoice_id']}"
                     )
-            if not success and self.message_flood_control_until: break
+            if not success and self.message_flood_control_until:
+                # The current message was re-queued by the send helper; retain
+                # the untouched tail too instead of silently dropping it.
+                self.pending_messages.extend(messages[index + 1:])
+                break
             await asyncio.sleep(1)
     
     async def reauth_scheduler(self):
@@ -764,15 +768,10 @@ class BotService:
                     await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "❌ Auth Error", None)
                     return
 
-                base_url = getattr(self.config, 'ggsel_base_url', 'https://seller.ggsel.net/api_sellers/api').rstrip('/')
-                url = f"{base_url}/sellers/account/balance/info?token={self.ggsel_api.token}"
-                
-                import httpx
-                # Reduced timeout to 5 seconds to prevent Telegram TimedOut error
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.get(url, headers={'Accept': 'application/json'})
-                    response.raise_for_status()
-                    res_data = response.json()
+                loop = asyncio.get_event_loop()
+                res_data = await loop.run_in_executor(None, self.ggsel_api.get_balance_info)
+                if not res_data:
+                    raise RuntimeError("GGSel balance request failed")
                 
                 if res_data.get("retval") == 0:
                     content = res_data.get("content", {})
@@ -791,12 +790,8 @@ class BotService:
                 keyboard = [[InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]]
                 await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, balance_text, keyboard)
 
-            except httpx.ReadTimeout:
-                logging.error("GGSel API Timeout on manual check")
-                keyboard = [[InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]]
-                await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "⏳ GGSel API took too long to respond. Try again.", keyboard)
-            except Exception as e:
-                logging.error(f"Manual balance check error: {e}")
+            except Exception:
+                logging.error("Manual balance check failed")
                 keyboard = [[InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]]
                 await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "⚠️ Error connecting to GGSel. They might be temporarily down.", keyboard)
         elif data == "main_menu": await self.telegram_bot._handle_menu_command(update, context)
@@ -1329,23 +1324,18 @@ class BotService:
     async def show_balance(self, update, context):
         query = update.callback_query
         try:
-            import json, urllib.request
             api = GGSelAPI(self.config)
-            if not api.login(): raise Exception("Failed to login to GGSel.")
-            
-            base_url = getattr(self.config, 'ggsel_base_url', 'https://seller.ggsel.net/api_sellers/api').rstrip('/')
-            req = urllib.request.Request(f"{base_url}/sellers/account/balance/info?token={api.token}")
-            req.add_header('Accept', 'application/json')
-            req.add_header('User-Agent', 'Mozilla/5.0')
-            
-            with urllib.request.urlopen(req, timeout=15) as response:
-                content = json.loads(response.read().decode('utf-8')).get("content", {})
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, api.get_balance_info)
+            if not result:
+                raise RuntimeError("GGSel balance request failed")
+            content = result["content"]
             
             avail, hold = float(content.get("amount_t_free") or 0.0), float(content.get("amount_t_lock") or 0.0)
             text = f"{_('balance_header')}{_('balance_body').format(total=f'{avail+hold:.2f}', avail=f'{avail:.2f}', hold=f'{hold:.2f}', curr='USD')}"
             await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, text, self.get_balance_markup().inline_keyboard)
-        except Exception as e:
-            logging.error(f"Balance error: {e}")
+        except Exception:
+            logging.error("Balance request failed")
             await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, _("balance_error"), self.get_main_menu_markup().inline_keyboard)
 
     async def balance_monitor_loop(self):
@@ -1361,13 +1351,10 @@ class BotService:
                 if not await self.ensure_ggsel_auth():
                     continue
                     
-                base_url = getattr(self.config, 'ggsel_base_url', 'https://seller.ggsel.net/api_sellers/api').rstrip('/')
-                url = f"{base_url}/sellers/account/balance/info?token={self.ggsel_api.token}"
-                
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    response = await client.get(url, headers={'Accept': 'application/json'})
-                    response.raise_for_status()
-                    res_data = response.json()
+                loop = asyncio.get_event_loop()
+                res_data = await loop.run_in_executor(None, self.ggsel_api.get_balance_info)
+                if not res_data:
+                    continue
                     
                 content = res_data.get("content", {})
                 current_avail = float(content.get("amount_t_free") or 0.0)

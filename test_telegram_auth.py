@@ -13,7 +13,7 @@ except ImportError:
     telegram = types.ModuleType("telegram")
 
     class Bot:
-        def __init__(self, token):
+        def __init__(self, token, **kwargs):
             self.token = token
 
     class InlineKeyboardMarkup:
@@ -55,6 +55,14 @@ except ImportError:
     sys.modules["telegram"] = telegram
     sys.modules["telegram.error"] = telegram_error
     sys.modules["telegram.ext"] = telegram_ext
+    telegram_request = types.ModuleType("telegram.request")
+
+    class HTTPXRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    telegram_request.HTTPXRequest = HTTPXRequest
+    sys.modules["telegram.request"] = telegram_request
 
 from config import Config
 from telegram_bot import TelegramBot
@@ -96,8 +104,85 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GGSEL_SELLER_ID"):
                 Config.from_env()
 
+    def test_old_environment_without_proxy_remains_supported(self):
+        env = {
+            "GGSEL_SELLER_ID": "1",
+            "GGSEL_API_KEY": "key",
+            "TELEGRAM_BOT_TOKEN": "123:token",
+            "TELEGRAM_GROUP_ID": "-1001",
+            "TELEGRAM_ALLOWED_USER_IDS": "42",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(Config.from_env().telegram_proxy_url)
+
+    def test_http_and_socks5_proxy_urls_are_accepted(self):
+        for value in (
+            "http://proxy.example:8080",
+            "socks5://user:p%40ss@proxy.example:1080",
+        ):
+            with self.subTest(value=value):
+                Config._validate_telegram_proxy_url(value)
+
+    def test_proxy_rejects_malformed_credentials_without_disclosure(self):
+        secret = "secret%2"
+        with self.assertRaises(ValueError) as raised:
+            Config._validate_telegram_proxy_url(
+                f"socks5://user:{secret}@proxy.example:1080"
+            )
+        self.assertNotIn(secret, str(raised.exception))
+
 
 class TelegramBotTests(unittest.TestCase):
+    def test_proxy_configures_both_ptb_transports(self):
+        requests = []
+
+        def request_factory(**kwargs):
+            request = object()
+            requests.append((request, kwargs))
+            return request
+
+        created_bot = SimpleNamespace(send_message=AsyncMock())
+        with patch("telegram_bot.HTTPXRequest", side_effect=request_factory), patch(
+            "telegram_bot.Bot", return_value=created_bot
+        ) as bot_class:
+            bot = TelegramBot(
+                make_config(telegram_proxy_url="socks5://proxy.example:1080")
+            )
+
+        self.assertIs(bot.bot, created_bot)
+        self.assertEqual(
+            [kwargs for _request, kwargs in requests],
+            [
+                {"proxy": "socks5://proxy.example:1080"},
+                {"proxy": "socks5://proxy.example:1080"},
+            ],
+        )
+        bot_class.assert_called_once_with(
+            token="123456:token",
+            request=requests[0][0],
+            get_updates_request=requests[1][0],
+        )
+
+    def test_application_uses_the_configured_bot(self):
+        bot = TelegramBot(make_config())
+        builder = unittest.mock.Mock()
+        builder.bot.return_value = builder
+        application = SimpleNamespace(
+            add_handler=lambda _handler: None,
+            initialize=AsyncMock(),
+            start=AsyncMock(),
+            updater=SimpleNamespace(start_polling=AsyncMock()),
+        )
+        builder.build.return_value = application
+        application_class = SimpleNamespace(builder=lambda: builder)
+
+        with patch("telegram_bot.Application", application_class), patch(
+            "telegram_bot.CommandHandler", return_value=object()
+        ), patch("telegram_bot.CallbackQueryHandler", return_value=object()):
+            asyncio.run(bot.start())
+
+        builder.bot.assert_called_once_with(bot.bot)
+
     def test_callback_is_denied_by_default_even_in_allowed_group(self):
         bot = TelegramBot(make_config(telegram_allowed_user_ids=frozenset()))
         bot.callback_handler = AsyncMock()
@@ -120,7 +205,8 @@ class TelegramBotTests(unittest.TestCase):
 
     def test_send_message_and_keyboard_contracts(self):
         bot = TelegramBot(make_config())
-        bot.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
+        transport = AsyncMock(return_value=SimpleNamespace(message_id=7))
+        object.__setattr__(bot.bot, "send_message", transport)
 
         result = asyncio.run(bot.send_message_with_keyboard("hello", [[object()]], None))
 
@@ -131,13 +217,13 @@ class TelegramBotTests(unittest.TestCase):
 
     def test_send_error_classification(self):
         bot = TelegramBot(make_config())
-        bot.bot.send_message = AsyncMock(side_effect=BadRequest("bad markup"))
+        object.__setattr__(bot.bot, "send_message", AsyncMock(side_effect=BadRequest("bad markup")))
         self.assertEqual(asyncio.run(bot.send_message("x", -1)), (False, None))
 
-        bot.bot.send_message = AsyncMock(side_effect=TimedOut("timeout"))
+        object.__setattr__(bot.bot, "send_message", AsyncMock(side_effect=TimedOut("timeout")))
         self.assertEqual(asyncio.run(bot.send_message("x", -1)), (False, 60))
 
-        bot.bot.send_message = AsyncMock(side_effect=RetryAfter(3))
+        object.__setattr__(bot.bot, "send_message", AsyncMock(side_effect=RetryAfter(3)))
         self.assertEqual(asyncio.run(bot.send_message("x", -1)), (False, 3))
 
 

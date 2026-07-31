@@ -240,14 +240,11 @@ class GGSelAPI:
             json={"message": cleaned},
             headers={"Content-Type": "application/json"},
         )
-        data = self._json(response) if response is not None else None
-        # A 2xx response without the documented success marker is not proof of
-        # delivery and must not be reported as successful.
-        if isinstance(data, dict) and data.get("retval") == 0:
+        # The endpoint documents HTTP 200 as success and does not require a
+        # JSON response body. Requiring `retval` can cause duplicate sends.
+        if response is not None:
             self.last_failure = None
             return True
-        if response is not None:
-            self.last_failure = APIFailure.PERMANENT
         return False
 
     def get_last_sales(self, top: int = 10) -> Optional[Dict[str, Any]]:
@@ -265,11 +262,23 @@ class GGSelAPI:
             self.last_failure = APIFailure.PERMANENT
         return None
 
+    def get_balance_info(self) -> Optional[Dict[str, Any]]:
+        response = self._authenticated_request("GET", "sellers/account/balance/info")
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict) and data.get("retval") == 0 and isinstance(data.get("content"), dict):
+            self.last_failure = None
+            return data
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
+        return None
+
     def get_purchase_info(self, invoice_id: int) -> Optional[Dict[str, Any]]:
         if not isinstance(invoice_id, int) or isinstance(invoice_id, bool) or invoice_id <= 0:
             self.last_failure = APIFailure.PERMANENT
             return None
-        response = self._authenticated_request("GET", f"purchase/info/{invoice_id}")
+        response = self._authenticated_request(
+            "GET", f"purchase/info/{invoice_id}", headers={"locale": "ru"}
+        )
         data = self._json(response) if response is not None else None
         if isinstance(data, dict) and data.get("retval") == 0:
             self.last_failure = None

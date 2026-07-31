@@ -1,5 +1,5 @@
 # Telegram Bot API (with job-queue for the background monitor)
-python-telegram-bot[job-queue]==22.2
+python-telegram-bot[job-queue,socks]==22.2
 
 # HTTP requests for the GGSel API
 requests==2.32.4
