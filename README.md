@@ -174,6 +174,7 @@ python main.py
 | `/id`, `/myid` | In group | Show your personal Telegram user ID |
 | `/start_sync` | In group | Start GGSel synchronization and customer messaging |
 | `/stop_sync` | In group | Stop GGSel synchronization and customer messaging; Telegram stays online |
+| `/sync_nomessage` | In group | Synchronize normally but suppress automatic customer messages, including first-order greetings |
 | `/history` | In topic     | Load message history             |
 | `/options` | In topic     | Show purchase options            |
 

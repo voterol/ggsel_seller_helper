@@ -49,6 +49,9 @@ class BotService:
         self._sync_operation_lock = asyncio.Lock()
         self._customer_write_lock = asyncio.Lock()
         self.sync_enabled = self.database.get_setting("ggsel_sync_enabled") != "false"
+        self.automatic_customer_messages_enabled = (
+            self.database.get_setting("ggsel_automatic_customer_messages_enabled") != "false"
+        )
         self._sync_enabled_event = asyncio.Event()
         if self.sync_enabled:
             self._sync_enabled_event.set()
@@ -109,7 +112,7 @@ class BotService:
                 (review_id, review_hash, effect, status),
             )
 
-    async def _send_customer_message(self, chat_id: int, text: str, executor=None):
+    async def _send_customer_message(self, chat_id: int, text: str, executor=None, automatic: bool = False):
         """Return delivery result and its failure class from the same worker.
 
         Capturing last_failure in the worker avoids another concurrent API call
@@ -120,6 +123,8 @@ class BotService:
         async with self._customer_write_lock:
             if not getattr(self, 'sync_enabled', True):
                 return False, None
+            if automatic and not getattr(self, 'automatic_customer_messages_enabled', True):
+                return False, "suppressed"
             loop = asyncio.get_event_loop()
             def send():
                 succeeded = self.ggsel_api.send_message(chat_id, text)
@@ -179,6 +184,7 @@ class BotService:
         self.telegram_bot.set_review_handler(self.handle_review_command)
         self.telegram_bot.set_start_sync_handler(self.start_sync)
         self.telegram_bot.set_stop_sync_handler(self.pause_sync)
+        self.telegram_bot.set_sync_nomessage_handler(self.start_sync_without_messages)
         
         await self.telegram_bot.start()
         self.running = True
@@ -444,8 +450,11 @@ class BotService:
                     if greeting:
                         loop = asyncio.get_event_loop()
                         try:
-                            await self._send_customer_message(purchase.invoice_id, greeting)
-                            await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
+                            sent, _failure = await self._send_customer_message(
+                                purchase.invoice_id, greeting, automatic=True
+                            )
+                            if sent:
+                                await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
                         except Exception as e:
                             logging.error(f"Ошибка отправки приветствия: {e}")
                 return True
@@ -477,9 +486,14 @@ class BotService:
             if not all_messages and self.autoresponder.should_send_first_message():
                 greeting = self.autoresponder.get_first_message_text()
                 if greeting and chat_ids:
+                    sent_any = False
                     for chat_id in chat_ids:
-                        await self._send_customer_message(chat_id, greeting)
-                    await self.send_message_with_cooldown(greeting, topic_id)
+                        sent, _failure = await self._send_customer_message(
+                            chat_id, greeting, automatic=True
+                        )
+                        sent_any = sent_any or sent
+                    if sent_any:
+                        await self.send_message_with_cooldown(greeting, topic_id)
                 return
             
             if not all_messages: return
@@ -651,9 +665,14 @@ class BotService:
                     customer_status = self.message_manager.get_effect_status(chat_id, message_id, "autoresponder")
                     if customer_status == self.message_manager.PENDING:
                         if response_text:
-                            reply_sent, failure = await self._send_customer_message(chat_id, response_text)
+                            reply_sent, failure = await self._send_customer_message(
+                                chat_id, response_text, automatic=True
+                            )
                             if reply_sent:
                                 self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.COMPLETED)
+                            elif failure == "suppressed":
+                                self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.COMPLETED)
+                                self.message_manager.set_effect_status(chat_id, message_id, "autoresponder_mirror", self.message_manager.COMPLETED)
                             elif self._is_terminal_api_failure(failure):
                                 self.message_manager.set_effect_status(chat_id, message_id, "autoresponder", self.message_manager.PERMANENT_FAILURE)
                         else:
@@ -787,17 +806,44 @@ class BotService:
     
     async def start_sync(self) -> str:
         async with self._sync_transition_lock:
-            if self.sync_enabled:
+            if self.sync_enabled and self.automatic_customer_messages_enabled:
                 return "✅ Synchronization is already running."
-            self.database.set_setting("ggsel_sync_enabled", "true")
-            self.sync_enabled = True
-            self._sync_enabled_event.set()
+            # Let writes already queued in no-message mode observe suppression
+            # before opening admission for automatic messages again.
+            async with self._customer_write_lock:
+                self.database.set_settings({
+                    "ggsel_sync_enabled": "true",
+                    "ggsel_automatic_customer_messages_enabled": "true",
+                })
+                self.sync_enabled = True
+                self.automatic_customer_messages_enabled = True
+                self._sync_enabled_event.set()
             if self.running:
                 asyncio.create_task(self._background_boot_sequence())
                 asyncio.create_task(self._run_sync_operation(self.sync_topics_with_purchases))
                 asyncio.create_task(self._run_sync_operation(self.check_new_reviews))
             logging.info("GGSel synchronization started by an operator")
             return "▶️ GGSel synchronization started."
+
+    async def start_sync_without_messages(self) -> str:
+        async with self._sync_transition_lock:
+            already_active = self.sync_enabled and not self.automatic_customer_messages_enabled
+            self.database.set_settings({
+                "ggsel_sync_enabled": "true",
+                "ggsel_automatic_customer_messages_enabled": "false",
+            })
+            self.sync_enabled = True
+            self.automatic_customer_messages_enabled = False
+            self._sync_enabled_event.set()
+            async with self._customer_write_lock:
+                pass
+            if self.running and not already_active:
+                asyncio.create_task(self._background_boot_sequence())
+                asyncio.create_task(self._run_sync_operation(self.sync_topics_with_purchases))
+                asyncio.create_task(self._run_sync_operation(self.check_new_reviews))
+            if already_active:
+                return "🔕 Synchronization without automatic customer messages is already active."
+            return "🔕 Synchronization is running. Automatic customer messages are disabled."
 
     async def pause_sync(self) -> str:
         async with self._sync_transition_lock:
@@ -1275,9 +1321,14 @@ class BotService:
                     self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.COMPLETED)
                 else:
                     try:
-                        reply_sent, failure = await self._send_customer_message(int(invoice_id), auto_response, _executor)
+                        reply_sent, failure = await self._send_customer_message(
+                            int(invoice_id), auto_response, _executor, automatic=True
+                        )
                         if reply_sent:
                             self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.COMPLETED)
+                        elif failure == "suppressed":
+                            self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.COMPLETED)
+                            self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.COMPLETED)
                         elif self._is_terminal_api_failure(failure):
                             self._set_review_effect_status(review_id, review_hash, "customer_reply", self.message_manager.PERMANENT_FAILURE)
                     except Exception as e:
@@ -1352,8 +1403,11 @@ class BotService:
                 if result.get("send_to_user") and result.get("user_message"):
                     user_msg = result["user_message"].replace("{option}", option_name).replace("{value}", option_value).replace("{sum}", option_value)
                     try:
-                        await self._send_customer_message(invoice_id, user_msg)
-                        await self.send_message_with_cooldown(f"📤 {user_msg}", topic_id)
+                        sent, _failure = await self._send_customer_message(
+                            invoice_id, user_msg, automatic=True
+                        )
+                        if sent:
+                            await self.send_message_with_cooldown(f"📤 {user_msg}", topic_id)
                     except Exception as e: logging.error(f"CSV User msg error: {e}")
         except Exception as e: logging.error(f"CSV process error: {e}")
     

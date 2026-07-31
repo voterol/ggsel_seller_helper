@@ -171,12 +171,16 @@ class Database:
         return row[0] if row else None
 
     def set_setting(self, key: str, value: str) -> None:
+        self.set_settings({key: value})
+
+    def set_settings(self, settings: dict) -> None:
+        """Persist related service settings in one transaction."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+            conn.executemany(
                 'INSERT INTO service_settings (key, value) VALUES (?, ?) '
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, '
                 'updated_at = CURRENT_TIMESTAMP',
-                (key, value),
+                settings.items(),
             )
 
     def get_chat(self, chat_id: int) -> Optional[Chat]:
