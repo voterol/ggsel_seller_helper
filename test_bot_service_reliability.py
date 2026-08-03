@@ -5,7 +5,7 @@ import types
 import unittest
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock, call, patch
 from database import Database
 from message_manager import MessageManager
@@ -169,9 +169,10 @@ class BotServiceReliabilityTests(unittest.TestCase):
         service.autoresponder = Mock()
         service.autoresponder.should_send_first_message.return_value = False
         service.usd_rub_rate = 90
+        service.installed_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
         from purchase_manager import Purchase
-        purchase = Purchase(123, 1, 2, "cart", "item", 10, "USD", 1, "", "", "e", "a", "1", "", "", "card", "", "now")
+        purchase = Purchase(123, 1, 2, "cart", "item", 10, "USD", 1, "2024-01-02T00:00:00Z", "", "e", "a", "1", "", "", "card", "", "now")
         self.assertFalse(asyncio.run(service.create_topic_for_purchase(purchase)))
         self.assertTrue(asyncio.run(service.create_topic_for_purchase(purchase)))
         service.telegram_bot.create_topic.assert_not_called()
@@ -182,8 +183,9 @@ class BotServiceReliabilityTests(unittest.TestCase):
         service.ensure_ggsel_auth = AsyncMock(return_value=True)
         service.ggsel_api = Mock()
         service.ggsel_api.get_last_sales.return_value = {
-            "retval": 0, "sales": [{"invoice_id": 11}]
+            "retval": 0, "sales": [{"invoice_id": 11, "date": "2024-01-02T00:00:00Z"}]
         }
+        service.installed_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
         service.purchase_manager = Mock()
         service.purchase_manager.get_pending_purchase_ids.return_value = [7, 11]
         service.purchase_manager.is_purchase_processed.return_value = False
@@ -197,6 +199,66 @@ class BotServiceReliabilityTests(unittest.TestCase):
             [call.args[0] for call in service.process_new_purchase.await_args_list],
             [11, 7],
         )
+
+    def test_purchase_scan_ignores_sales_before_installation(self):
+        service = object.__new__(BotService)
+        service.ensure_ggsel_auth = AsyncMock(return_value=True)
+        service.ggsel_api = Mock()
+        service.ggsel_api.get_last_sales.return_value = {
+            "retval": 0,
+            "sales": [
+                {"invoice_id": 10, "date": "2023-12-31T23:59:59Z"},
+                {"invoice_id": 11, "date": "2024-01-01T00:00:00Z"},
+            ],
+        }
+        service.installed_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        service.purchase_manager = Mock()
+        service.purchase_manager.get_pending_purchase_ids.return_value = []
+        service.purchase_manager.is_purchase_processed.return_value = False
+        service.failed_topics = {}
+        service.process_new_purchase = AsyncMock()
+
+        asyncio.run(service.check_new_purchases())
+
+        service.process_new_purchase.assert_awaited_once_with(11)
+
+    def test_pre_install_purchase_cannot_create_telegram_topic(self):
+        service = object.__new__(BotService)
+        service.installed_at = datetime(2024, 1, 2, tzinfo=timezone.utc)
+        service.telegram_bot = Mock()
+        service.topic_manager = Mock()
+        service.send_message_with_cooldown = AsyncMock()
+        from purchase_manager import Purchase
+        purchase = Purchase(123, 1, 2, "cart", "item", 10, "USD", 1, "2024-01-01T00:00:00Z", "", "e", "a", "1", "", "", "card", "", "now")
+
+        self.assertFalse(asyncio.run(service.create_topic_for_purchase(purchase)))
+
+        service.telegram_bot.create_topic.assert_not_called()
+        service.send_message_with_cooldown.assert_not_awaited()
+
+    def test_detailed_pre_install_purchase_is_not_staged_or_delivered(self):
+        service = object.__new__(BotService)
+        service.installed_at = datetime(2024, 1, 2, tzinfo=timezone.utc)
+        service.failed_topics = {}
+        service.ensure_ggsel_auth = AsyncMock(return_value=True)
+        service.ggsel_api = Mock()
+        service.ggsel_api.get_purchase_info.return_value = {
+            "retval": 0,
+            "content": {"purchase_date": "2024-01-01T00:00:00Z"},
+        }
+        service.purchase_manager = Mock()
+        from purchase_manager import PurchaseManager
+        service.purchase_manager.parse_purchase_response.side_effect = (
+            lambda data, invoice_id: PurchaseManager.parse_purchase_response(
+                service.purchase_manager, data, invoice_id
+            )
+        )
+        service.create_topic_for_purchase = AsyncMock()
+
+        asyncio.run(service.process_new_purchase(123))
+
+        service.purchase_manager.add_purchase.assert_not_called()
+        service.create_topic_for_purchase.assert_not_awaited()
 
     def test_review_is_recorded_only_after_side_effects_succeed(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)

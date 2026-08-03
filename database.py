@@ -1,6 +1,6 @@
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -169,6 +169,26 @@ class Database:
                 'SELECT value FROM service_settings WHERE key = ?', (key,)
             ).fetchone()
         return row[0] if row else None
+
+    def get_or_create_installation_time(self) -> str:
+        """Return the immutable UTC cutoff used to ignore pre-install orders."""
+        installed_at = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path, isolation_level=None) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO service_settings (key, value) VALUES (?, ?)",
+                    ("bot_installed_at", installed_at),
+                )
+                row = conn.execute(
+                    "SELECT value FROM service_settings WHERE key = ?",
+                    ("bot_installed_at",),
+                ).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return row[0]
 
     def set_setting(self, key: str, value: str) -> None:
         self.set_settings({key: value})

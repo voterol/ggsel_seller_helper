@@ -178,6 +178,8 @@ python main.py
 | `/history` | In topic     | Load message history             |
 | `/options` | In topic     | Show purchase options            |
 
+Only orders created on or after this bot installation are imported. The installation cutoff is stored in SQLite and remains unchanged after restarts.
+
 ---
 
 ## 🎯 Режим ЧСВ

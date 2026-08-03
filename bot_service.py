@@ -4,7 +4,7 @@ import os
 import sqlite3
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from config import Config
@@ -32,6 +32,9 @@ class BotService:
         self.topic_manager = TopicManager(self.database)
         self.message_manager = MessageManager(self.database)
         self.purchase_manager = PurchaseManager(self.database)
+        self.installed_at = self._parse_api_datetime(
+            self.database.get_or_create_installation_time()
+        )
         self.autoresponder = AutoResponder()
         
         self.running = False
@@ -60,6 +63,32 @@ class BotService:
         
         self._load_pending_topics()
         self._load_processed_reviews()
+
+    @staticmethod
+    def _parse_api_datetime(value: str) -> Optional[datetime]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.strip()
+        if normalized.endswith(("Z", "z")):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            # GGSel historically returns Moscow-local timestamps without an offset.
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=3)))
+        return parsed.astimezone(timezone.utc)
+
+    def _is_purchase_after_installation(self, purchase_date: str, invoice_id=None) -> bool:
+        purchased_at = self._parse_api_datetime(purchase_date)
+        if purchased_at is None:
+            logging.warning(f"Ignoring purchase {invoice_id}: missing or invalid purchase date")
+            return False
+        if purchased_at < self.installed_at:
+            logging.info(f"Ignoring pre-install purchase {invoice_id}")
+            return False
+        return True
         
     def get_main_menu_markup(self):
         keyboard = [
@@ -304,7 +333,13 @@ class BotService:
         
         if not sales_data or sales_data.get('retval') != 0: return
         
-        invoice_ids = [sale.get('invoice_id') for sale in sales_data.get('sales', [])]
+        invoice_ids = [
+            sale.get('invoice_id')
+            for sale in sales_data.get('sales', [])
+            if self._is_purchase_after_installation(
+                sale.get('date'), sale.get('invoice_id')
+            )
+        ]
         invoice_ids.extend(self.purchase_manager.get_pending_purchase_ids())
         for invoice_id in dict.fromkeys(invoice_ids):
             if not invoice_id: continue
@@ -331,6 +366,12 @@ class BotService:
                 return
             
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
+            if purchase and not self._is_purchase_after_installation(
+                purchase.purchase_date, purchase.invoice_id
+            ):
+                # Stop legacy pending rows from being retried forever.
+                self.purchase_manager.mark_purchase_processed(purchase.invoice_id)
+                return
             if purchase and self.purchase_manager.add_purchase(purchase):
                 logging.info(f"Purchase: {purchase.invoice_id} - {purchase.buyer_email}")
                 delivered = await self.create_topic_for_purchase(purchase)
@@ -344,6 +385,10 @@ class BotService:
     async def create_topic_for_purchase(self, purchase: Purchase, skip_greeting: bool = False):
         """Создание топика для покупки"""
         try:
+            if not self._is_purchase_after_installation(
+                purchase.purchase_date, purchase.invoice_id
+            ):
+                return False
             failed_time = self.failed_topics.get(purchase.invoice_id)
             if failed_time and datetime.now() - failed_time < timedelta(minutes=5):
                 return
@@ -1197,7 +1242,13 @@ class BotService:
         sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 30)
         if not sales_data or sales_data.get('retval') != 0: return
         
-        api_invoice_ids = {sale.get('invoice_id') for sale in sales_data.get('sales', []) if sale.get('invoice_id')}
+        api_invoice_ids = {
+            sale.get('invoice_id')
+            for sale in sales_data.get('sales', [])
+            if sale.get('invoice_id') and self._is_purchase_after_installation(
+                sale.get('date'), sale.get('invoice_id')
+            )
+        }
         existing_invoice_ids = {int(k.replace('purchase_', '')) for k in self.topic_manager.topics.keys() if k.startswith('purchase_')}
         
         missing_invoice_ids = api_invoice_ids - existing_invoice_ids

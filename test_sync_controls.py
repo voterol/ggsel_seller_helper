@@ -48,6 +48,16 @@ class SyncControlTests(unittest.TestCase):
         self.assertFalse(restarted.sync_enabled)
         self.assertIn("already stopped", self.loop.run_until_complete(restarted.pause_sync()))
 
+    def test_installation_time_is_created_once_and_survives_restart(self):
+        service = self.make_service()
+        installed_at = Database(self.path).get_setting("bot_installed_at")
+
+        restarted = self.make_service()
+
+        self.assertIsNotNone(installed_at)
+        self.assertEqual(Database(self.path).get_setting("bot_installed_at"), installed_at)
+        self.assertEqual(restarted.installed_at, service.installed_at)
+
     def test_start_is_idempotent_and_persisted(self):
         service = self.make_service()
         self.loop.run_until_complete(service.pause_sync())
