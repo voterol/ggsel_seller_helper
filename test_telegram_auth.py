@@ -234,26 +234,31 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn(("id", "myid"), [command for command, _callback in commands])
         self.assertIn("start_sync", [command for command, _callback in commands])
         self.assertIn("stop_sync", [command for command, _callback in commands])
+        self.assertIn("sync_nomessage", [command for command, _callback in commands])
 
     def test_sync_commands_require_authorization_and_delegate(self):
         bot = TelegramBot(make_config())
         bot.start_sync_handler = AsyncMock(return_value="started")
         bot.stop_sync_handler = AsyncMock(return_value="stopped")
+        bot.sync_nomessage_handler = AsyncMock(return_value="no messages")
         authorized = make_update()
 
         asyncio.run(bot._handle_start_sync_command(authorized, None))
         asyncio.run(bot._handle_stop_sync_command(authorized, None))
+        asyncio.run(bot._handle_sync_nomessage_command(authorized, None))
 
         bot.start_sync_handler.assert_awaited_once_with()
         bot.stop_sync_handler.assert_awaited_once_with()
+        bot.sync_nomessage_handler.assert_awaited_once_with()
         self.assertEqual(
             [call.args[0] for call in authorized.effective_message.reply_text.await_args_list],
-            ["started", "stopped"],
+            ["started", "stopped", "no messages"],
         )
 
         unauthorized = make_update(user_id=99)
         asyncio.run(bot._handle_start_sync_command(unauthorized, None))
         asyncio.run(bot._handle_stop_sync_command(unauthorized, None))
+        asyncio.run(bot._handle_sync_nomessage_command(unauthorized, None))
         unauthorized.effective_message.reply_text.assert_not_awaited()
 
     def test_id_command_reports_caller_in_configured_group_without_authorizing(self):
