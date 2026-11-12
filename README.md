@@ -12,7 +12,7 @@ An automatic bot for GGSel sellers — monitoring purchases and two-way communic
 | ⭐ **Review replies**         | Automatic replies to positive/negative reviews |
 | 🎯 **CSV mode**              | Reacts to purchase options with conditions     |
 
-
+# Telegram chat https://t.me/+QU54yBqx8jJjNzc6
 ---
 
 ## 🚀 Installation
