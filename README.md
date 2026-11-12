@@ -102,11 +102,19 @@ For a new installation, use the interactive setup. It asks for the required
 GGSel and Telegram values, a non-empty operator allowlist, and an optional HTTP
 or SOCKS5 proxy. Secret values and proxy passwords are entered without echo.
 The resulting file is replaced atomically with mode `0600`; an existing `.env`
-is not replaced without explicit confirmation.
+is not replaced without explicit confirmation. The wizard first asks for the
+interface language (Русский, English, Українська, Español, Deutsch); the choice
+is stored in `bot_lang.json` and also becomes the bot's UI language.
 
 ```bash
 python setup.py
 ```
+
+Running `python main.py` without a valid `.env` also launches this setup wizard
+automatically (interactive terminals only — after a short notice, press Ctrl+C
+to cancel). When the bot runs under a service manager or otherwise without a
+TTY, the wizard is skipped and startup fails fast; prepare the configuration
+with `python setup.py` (or from `.env.example`) beforehand.
 
 Alternatively, create it manually:
 
@@ -179,6 +187,18 @@ python main.py
 | `/options` | In topic     | Show purchase options            |
 
 Only orders created on or after this bot installation are imported. The installation cutoff is stored in SQLite and remains unchanged after restarts.
+
+---
+
+## 🌐 Languages
+
+The bot UI ships with 🇷🇺 Russian, 🇬🇧 English, 🇺🇦 Ukrainian, 🇪🇸 Spanish, and
+🇩🇪 German. Switch the language in the group via `/menu` → the language button;
+the choice is stored in `bot_lang.json` and survives restarts.
+
+To add another language, drop a `<code>.json` file (e.g. `fr.json`) into the
+`translations/` directory with exactly the same keys as `ru.json` — it appears
+in the language picker automatically after a restart.
 
 ---
 

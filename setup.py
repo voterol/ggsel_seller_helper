@@ -8,9 +8,29 @@ from typing import Dict, Optional
 from urllib.parse import quote
 
 from config import Config
+from locales import locales, _, LANGUAGE_NAMES
 
 
 ENV_PATH = Path(__file__).resolve().with_name(".env")
+
+
+def choose_language() -> Optional[str]:
+    """Ask for the wizard language; the choice persists for the bot UI too."""
+    codes = locales.available_languages()
+    print("🌐 Language / Язык / Мова / Idioma / Sprache:")
+    for number, code in enumerate(codes, start=1):
+        print(f"{number}) {LANGUAGE_NAMES.get(code, code)}")
+    while True:
+        try:
+            number = int(input().strip())
+        except ValueError:
+            number = 0
+        if 1 <= number <= len(codes):
+            code = codes[number - 1]
+            locales.lang = code
+            locales.save_lang()
+            return code
+        print(_("setup_choose_lang_invalid"))
 
 
 def _required(prompt: str, *, secret: bool = False) -> str:
@@ -19,7 +39,7 @@ def _required(prompt: str, *, secret: bool = False) -> str:
         value = reader(prompt).strip()
         if value and "\n" not in value and "\r" not in value:
             return value
-        print("Значение обязательно и должно занимать одну строку.")
+        print(_("setup_value_required"))
 
 
 def _integer(prompt: str, *, positive: bool, nonzero: bool = False) -> str:
@@ -28,10 +48,10 @@ def _integer(prompt: str, *, positive: bool, nonzero: bool = False) -> str:
         try:
             number = int(value)
         except ValueError:
-            print("Введите целое число.")
+            print(_("setup_enter_integer"))
             continue
         if (positive and number <= 0) or (nonzero and number == 0):
-            print("Недопустимое числовое значение.")
+            print(_("setup_invalid_number"))
             continue
         return str(number)
 
@@ -42,16 +62,16 @@ def _yes_no(prompt: str, *, default: bool = False) -> bool:
         answer = input(prompt + suffix).strip().lower()
         if not answer:
             return default
-        if answer in {"y", "yes", "д", "да"}:
+        if answer in {"y", "yes", "д", "да", "s", "sí", "j", "ja", "т", "так"}:
             return True
-        if answer in {"n", "no", "н", "нет"}:
+        if answer in {"n", "no", "н", "нет", "nein", "ні"}:
             return False
-        print("Ответьте yes или no.")
+        print(_("setup_yes_no_hint"))
 
 
 def _allowed_ids() -> str:
     while True:
-        value = _required("Разрешённые Telegram user ID (через запятую): ")
+        value = _required(_("setup_allowed_ids"))
         try:
             ids = Config._allowed_user_ids(value)
         except ValueError as exc:
@@ -62,27 +82,33 @@ def _allowed_ids() -> str:
 
 
 def _proxy_url() -> Optional[str]:
-    if not _yes_no("Нужен Telegram proxy?"):
+    if not _yes_no(_("setup_proxy_ask")):
         return None
     while True:
-        kind = input("Тип proxy (HTTP/SOCKS): ").strip().lower()
+        kind = input(_("setup_proxy_type")).strip().lower()
         if kind in {"http", "socks", "socks5"}:
             scheme = "http" if kind == "http" else "socks5"
             break
-        print("Выберите HTTP или SOCKS.")
-    host = _required("Proxy host: ")
-    if any(char in host for char in "/@?#"):
-        raise ValueError("Proxy host должен быть именем хоста или IP-адресом")
-    port = _integer("Proxy port: ", positive=True)
-    if int(port) > 65535:
-        raise ValueError("Proxy port должен быть в диапазоне 1-65535")
+        print(_("setup_proxy_type_invalid"))
+    while True:
+        host = _required(_("setup_proxy_host"))
+        if not any(char in host for char in "/@?#"):
+            break
+        print(_("setup_proxy_host_invalid"))
+    while True:
+        port = _integer(_("setup_proxy_port"), positive=True)
+        if int(port) <= 65535:
+            break
+        print(_("setup_proxy_port_range"))
 
     auth = ""
-    if _yes_no("Proxy требует логин/пароль?"):
-        username = _required("Proxy username: ")
-        password = getpass("Proxy password (может быть пустым): ")
-        if "\n" in password or "\r" in password:
-            raise ValueError("Proxy password должен занимать одну строку")
+    if _yes_no(_("setup_proxy_auth")):
+        username = _required(_("setup_proxy_user"))
+        while True:
+            password = getpass(_("setup_proxy_pass"))
+            if "\n" not in password and "\r" not in password:
+                break
+            print(_("setup_proxy_pass_invalid"))
         auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
     url = f"{scheme}://{auth}{host}:{port}"
     Config._validate_telegram_proxy_url(url)
@@ -115,23 +141,30 @@ def write_env_atomic(path: Path, values: Dict[str, str]) -> None:
         raise
 
 
-def main() -> int:
-    if ENV_PATH.exists() and not _yes_no(".env уже существует. Перезаписать его?"):
-        print("Существующий .env не изменён.")
+def main(lang: Optional[str] = None) -> int:
+    if lang is None:
+        lang = choose_language()
+    else:
+        locales.lang = lang
+        locales.save_lang()
+    print(_("setup_missing_notice"))
+
+    if ENV_PATH.exists() and not _yes_no(_("setup_env_exists")):
+        print(_("setup_env_kept"))
         return 0
 
     values = {
-        "GGSEL_SELLER_ID": _integer("GGSel seller ID: ", positive=True),
-        "GGSEL_API_KEY": _required("GGSel API key: ", secret=True),
-        "TELEGRAM_BOT_TOKEN": _required("Telegram bot token: ", secret=True),
-        "TELEGRAM_GROUP_ID": _integer("Telegram group ID: ", positive=False, nonzero=True),
+        "GGSEL_SELLER_ID": _integer(_("setup_seller_id"), positive=True),
+        "GGSEL_API_KEY": _required(_("setup_api_key"), secret=True),
+        "TELEGRAM_BOT_TOKEN": _required(_("setup_token"), secret=True),
+        "TELEGRAM_GROUP_ID": _integer(_("setup_group_id"), positive=False, nonzero=True),
         "TELEGRAM_ALLOWED_USER_IDS": _allowed_ids(),
     }
     proxy_url = _proxy_url()
     if proxy_url:
         values["TELEGRAM_PROXY_URL"] = proxy_url
     write_env_atomic(ENV_PATH, values)
-    print(f"Настройка сохранена в {ENV_PATH} с правами 0600.")
+    print(_("setup_saved").replace("{path}", str(ENV_PATH)))
     return 0
 
 

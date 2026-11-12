@@ -6,7 +6,7 @@ from telegram.ext import Application, MessageHandler, CallbackQueryHandler, Comm
 from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 from config import Config
-from locales import locales, _ 
+from locales import locales, _, LANGUAGE_NAMES
 
 class TelegramBot:
     def __init__(self, config: Config):
@@ -174,6 +174,32 @@ class TelegramBot:
             await asyncio.sleep(e.retry_after)
             if update.callback_query: await update.callback_query.edit_message_text(_("menu_title"), reply_markup=markup)
             else: await update.message.reply_text(_("menu_title"), reply_markup=markup)
+        except BadRequest:
+            # Double-tap on "back" re-renders an identical message.
+            pass
+
+    def _language_menu_markup(self):
+        keyboard = []
+        for code in locales.available_languages():
+            name = LANGUAGE_NAMES.get(code, code)
+            label = f"✅ {name}" if code == locales.lang else name
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"lang_select_{code}")])
+        keyboard.append([InlineKeyboardButton(_("btn_back"), callback_data="main_menu")])
+        return InlineKeyboardMarkup(keyboard)
+
+    async def _show_language_menu(self, update: Update, context):
+        title = _("lang_menu_title")
+        markup = self._language_menu_markup()
+        try:
+            if update.callback_query: await update.callback_query.edit_message_text(title, reply_markup=markup)
+            else: await update.message.reply_text(title, reply_markup=markup)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            if update.callback_query: await update.callback_query.edit_message_text(title, reply_markup=markup)
+            else: await update.message.reply_text(title, reply_markup=markup)
+        except BadRequest:
+            # Clicking the already-active language re-renders an identical menu.
+            pass
 
     async def _handle_callback(self, update: Update, context):
         query = update.callback_query
@@ -187,8 +213,12 @@ class TelegramBot:
             await query.message.delete()
             return
         if query.data == "lang_toggle":
-            locales.toggle()
-            await self._handle_menu_command(update, context)
+            await self._show_language_menu(update, context)
+            return
+        if query.data.startswith("lang_select_"):
+            code = query.data[len("lang_select_"):]
+            locales.set_lang(code)
+            await self._show_language_menu(update, context)
             return
         if self.callback_handler:
             await self.callback_handler(query.data, update, context)
