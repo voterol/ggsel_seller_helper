@@ -3,15 +3,57 @@ import logging
 import signal
 import sys
 import os
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import Config
+import setup
+from config import Config, reload_env
 from bot_service import BotService
 from auto_updater import check_and_update, check_update_available, get_current_version
 
 # How often to check GitHub for updates (2 hours)
 UPDATE_CHECK_INTERVAL = 7200
+
+
+def ensure_config() -> Optional[Config]:
+    """Return a validated Config, launching the setup wizard when .env is missing.
+
+    In non-interactive environments the wizard cannot ask questions, so we only
+    log instructions and return None for the caller to exit.
+    """
+    try:
+        return Config.from_env()
+    except ValueError as e:
+        logging.error(f"Конфигурация не найдена или неполна: {e}")
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        logging.error(
+            "Запустите 'python setup.py' в интерактивном терминале или создайте "
+            ".env по образцу .env.example."
+        )
+        return None
+
+    print("Конфигурация не найдена или неполна — запускаю мастер настройки (setup). Нажмите Ctrl+C для отмены.")
+    try:
+        result = setup.main()
+    except (KeyboardInterrupt, EOFError, ValueError):
+        # Ctrl+C/Ctrl+D и ошибки ввода мастера (например, невалидный proxy host)
+        # не должны выглядеть как сбой приложения.
+        logging.error("Мастер настройки прерван. Создайте .env по образцу .env.example и перезапустите бота.")
+        return None
+    if result == 0 and setup.ENV_PATH.is_file():
+        # override=True: файл только что написан пользователем интерактивно,
+        # его значения авторитетнее устаревших переменных окружения (даже пустых).
+        reload_env(override=True)
+        try:
+            return Config.from_env()
+        except ValueError as e:
+            logging.error(f"После мастера настройки конфигурация всё ещё неполна: {e}")
+            return None
+    logging.error("Мастер настройки не завершился. Создайте .env по образцу .env.example и перезапустите бота.")
+    return None
+
 
 async def update_checker(auto_update_enabled: bool, version: str, sha256: str):
     """Periodically notify only; never download, install, or restart."""
@@ -44,8 +86,10 @@ def setup_logging():
 
 async def main():
     try:
-        config = Config.from_env()
-        # Config validation must complete before any network or update operation.
+        # Setup must complete before any network or update operation.
+        config = ensure_config()
+        if config is None:
+            sys.exit(1)
         config.validate()
         logging.info(f"🚀 GGSel Bot v{get_current_version()}")
 

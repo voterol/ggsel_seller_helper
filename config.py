@@ -9,13 +9,25 @@ try:
     # Ищем .env файл только в текущей директории (ggsel_bot/)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     env_path = os.path.join(current_dir, '.env')
-    
+
     # Credentials are literal values; do not expand ${NAME} inside secrets.
     load_dotenv(env_path, interpolate=False)
-        
+
 except ImportError:
     # Если python-dotenv не установлен, продолжаем без него
-    pass
+    load_dotenv = None
+    env_path = None
+
+
+def reload_env(override: bool = False) -> None:
+    """Re-read .env (e.g. after the setup wizard wrote it).
+
+    override=True is intended right after the interactive wizard: the freshly
+    typed answers must win over stale (even empty) inherited environment vars.
+    """
+    if load_dotenv is None:
+        return
+    load_dotenv(env_path, interpolate=False, override=override)
 
 @dataclass
 class Config:

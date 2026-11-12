@@ -108,6 +108,12 @@ is not replaced without explicit confirmation.
 python setup.py
 ```
 
+Running `python main.py` without a valid `.env` also launches this setup wizard
+automatically (interactive terminals only — after a short notice, press Ctrl+C
+to cancel). When the bot runs under a service manager or otherwise without a
+TTY, the wizard is skipped and startup fails fast; prepare the configuration
+with `python setup.py` (or from `.env.example`) beforehand.
+
 Alternatively, create it manually:
 
 ```bash
@@ -179,6 +185,18 @@ python main.py
 | `/options` | In topic     | Show purchase options            |
 
 Only orders created on or after this bot installation are imported. The installation cutoff is stored in SQLite and remains unchanged after restarts.
+
+---
+
+## 🌐 Languages
+
+The bot UI ships with 🇷🇺 Russian, 🇬🇧 English, 🇺🇦 Ukrainian, 🇪🇸 Spanish, and
+🇩🇪 German. Switch the language in the group via `/menu` → the language button;
+the choice is stored in `bot_lang.json` and survives restarts.
+
+To add another language, drop a `<code>.json` file (e.g. `fr.json`) into the
+`translations/` directory with exactly the same keys as `ru.json` — it appears
+in the language picker automatically after a restart.
 
 ---
 
