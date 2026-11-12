@@ -102,7 +102,9 @@ For a new installation, use the interactive setup. It asks for the required
 GGSel and Telegram values, a non-empty operator allowlist, and an optional HTTP
 or SOCKS5 proxy. Secret values and proxy passwords are entered without echo.
 The resulting file is replaced atomically with mode `0600`; an existing `.env`
-is not replaced without explicit confirmation.
+is not replaced without explicit confirmation. The wizard first asks for the
+interface language (Русский, English, Українська, Español, Deutsch); the choice
+is stored in `bot_lang.json` and also becomes the bot's UI language.
 
 ```bash
 python setup.py

@@ -34,7 +34,6 @@ def ensure_config() -> Optional[Config]:
         )
         return None
 
-    print("Конфигурация не найдена или неполна — запускаю мастер настройки (setup). Нажмите Ctrl+C для отмены.")
     try:
         result = setup.main()
     except (KeyboardInterrupt, EOFError, ValueError):

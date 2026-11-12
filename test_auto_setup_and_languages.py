@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import stat
 import string
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
 
 import main
+import setup
 from config import Config
 from locales import LocaleManager
 from telegram_bot import TelegramBot
@@ -294,6 +296,84 @@ class TelegramBotLanguageMenuTests(unittest.TestCase):
             update = self._run_callback(bot, "main_menu")
         bot.callback_handler.assert_awaited_once_with("main_menu", update, None)
         show.assert_not_called()
+
+
+class SetupWizardTests(unittest.TestCase):
+    """The language-first wizard: language choice, tokens, retries, artifacts."""
+
+    def test_choose_language_selects_third_language_and_persists_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "bot_lang.json"
+            with patch.object(setup.locales, "file_path", str(state)), \
+                 patch.object(setup.locales, "lang", "ru"), \
+                 patch("builtins.input", return_value="3"), \
+                 patch("builtins.print"):
+                code = setup.choose_language()
+                self.assertEqual(code, setup.locales.available_languages()[2])
+                # После выбора языка мастер задаёт вопросы уже на нём.
+                self.assertEqual(setup._("setup_seller_id"), load_table(code)["setup_seller_id"])
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8")), {"lang": code})
+
+    def test_choose_language_rejects_invalid_numbers_until_a_valid_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "bot_lang.json"
+            answers = iter(["nope", "0", "99", "1"])
+            messages = []
+            with patch.object(setup.locales, "file_path", str(state)), \
+                 patch.object(setup.locales, "lang", "ru"), \
+                 patch("builtins.input", side_effect=lambda *_args: next(answers)), \
+                 patch("builtins.print", side_effect=messages.append):
+                code = setup.choose_language()
+        self.assertEqual(code, setup.locales.available_languages()[0])
+        self.assertEqual(messages.count(load_table("ru")["setup_choose_lang_invalid"]), 3)
+        # Язык по умолчанию не должен утекать в bot_lang.json в корне репозитория.
+        self.assertFalse((Path(__file__).resolve().parent / "bot_lang.json").exists())
+
+    def test_yes_no_accepts_localized_tokens_and_rejects_garbage(self):
+        for answer, expected in (
+            ("sí", True), ("ja", True), ("так", True),
+            ("nein", False), ("ні", False),
+        ):
+            with self.subTest(answer=answer), patch("builtins.input", return_value=answer):
+                self.assertEqual(setup._yes_no("q?"), expected)
+        answers = iter(["maybe", "да"])
+        messages = []
+        with patch("builtins.input", side_effect=lambda *_args: next(answers)), \
+             patch("builtins.print", side_effect=messages.append):
+            self.assertTrue(setup._yes_no("q?"))
+        self.assertEqual(messages, [setup._("setup_yes_no_hint")])
+
+    def test_proxy_url_retries_invalid_host_and_port_instead_of_raising(self):
+        answers = iter(["yes", "http", "/", "proxy.local", "70000", "8080", "no"])
+        with patch("builtins.input", side_effect=lambda _prompt: next(answers)), \
+             patch("builtins.print"):
+            url = setup._proxy_url()
+        self.assertEqual(url, "http://proxy.local:8080")
+
+    def test_full_wizard_happy_path_writes_env_and_lang_state_in_temp_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            lang_state = Path(directory) / "bot_lang.json"
+            answers = iter(["4", "1", "123:token", "-100", "42", "no"])
+            with patch.object(setup, "ENV_PATH", env_path), \
+                 patch.object(setup.locales, "file_path", str(lang_state)), \
+                 patch.object(setup.locales, "lang", "ru"), \
+                 patch("builtins.input", side_effect=lambda *_args: next(answers)), \
+                 patch("setup.getpass", side_effect=["api-key", "123:token"]), \
+                 patch("builtins.print"):
+                self.assertEqual(setup.main(), 0)
+            self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
+            content = env_path.read_text(encoding="utf-8")
+            self.assertIn('GGSEL_SELLER_ID="1"', content)
+            self.assertIn('GGSEL_API_KEY="api-key"', content)
+            self.assertIn('TELEGRAM_BOT_TOKEN="123:token"', content)
+            self.assertIn('TELEGRAM_GROUP_ID="-100"', content)
+            self.assertIn('TELEGRAM_ALLOWED_USER_IDS="42"', content)
+            self.assertNotIn("TELEGRAM_PROXY_URL", content)
+            self.assertEqual(json.loads(lang_state.read_text(encoding="utf-8")), {"lang": "ru"})
+        repo_root = Path(__file__).resolve().parent
+        self.assertFalse((repo_root / ".env").exists())
+        self.assertFalse((repo_root / "bot_lang.json").exists())
 
 
 if __name__ == "__main__":
