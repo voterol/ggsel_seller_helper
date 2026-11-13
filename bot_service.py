@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import sqlite3
@@ -151,7 +152,7 @@ class BotService:
             self._customer_write_lock = asyncio.Lock()
         async with self._customer_write_lock:
             if not getattr(self, 'sync_enabled', True):
-                return False, None
+                return False, "sync_paused"
             if automatic and not getattr(self, 'automatic_customer_messages_enabled', True):
                 return False, "suppressed"
             loop = asyncio.get_event_loop()
@@ -175,13 +176,18 @@ class BotService:
             with sqlite3.connect(self.database.db_path) as conn:
                 cursor = conn.execute("SELECT data FROM pending_topics")
                 for row in cursor.fetchall():
-                    item = json.loads(row[0])
-                    purchase = Purchase(**item['purchase'])
-                    self.pending_topics.append({
-                        'purchase': purchase,
-                        'timestamp': datetime.fromisoformat(item['timestamp']),
-                        'skip_greeting': item.get('skip_greeting', False)
-                    })
+                    # Per-row tolerance: one corrupt row must not wipe the
+                    # remaining queue when _save_pending_topics rewrites it.
+                    try:
+                        item = json.loads(row[0])
+                        purchase = Purchase(**item['purchase'])
+                        self.pending_topics.append({
+                            'purchase': purchase,
+                            'timestamp': datetime.fromisoformat(item['timestamp']),
+                            'skip_greeting': item.get('skip_greeting', False)
+                        })
+                    except Exception as e:
+                        logging.warning(f"Skipping corrupt pending topic row: {e}")
                 if self.pending_topics:
                     logging.info(f"Loaded {len(self.pending_topics)} pending topics from DB")
         except Exception as e:
@@ -207,6 +213,9 @@ class BotService:
         
         self.telegram_bot.set_topic_message_handler(self.handle_topic_message)
         self.telegram_bot.set_callback_handler(self.handle_callback)
+        # Lets telegram_bot's own short-circuited menus (language submenu,
+        # close) cancel pending text-input prompts with the same semantics.
+        self.telegram_bot.set_awaiting_input(self.awaiting_input)
         self.telegram_bot.set_general_message_handler(self.handle_general_message)
         self.telegram_bot.set_history_handler(self.handle_history_command)
         self.telegram_bot.set_options_handler(self.handle_options_command)
@@ -286,6 +295,8 @@ class BotService:
                 result, _failure = await self._send_customer_message(invoice_id, message_text)
                 if result:
                     await self.telegram_bot.add_reaction(message_id, topic_id, "🔥")
+                elif _failure == "sync_paused":
+                    await self.send_message_with_cooldown("⏸ Sync is paused — /start_sync to resume", topic_id)
                 else:
                     await self.send_message_with_cooldown("❌ Send error", topic_id)
             except Exception as e:
@@ -366,12 +377,17 @@ class BotService:
                 return
             
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
-            if purchase and not self._is_purchase_after_installation(
-                purchase.purchase_date, purchase.invoice_id
-            ):
-                # Stop legacy pending rows from being retried forever.
-                self.purchase_manager.mark_purchase_processed(purchase.invoice_id)
-                return
+            if purchase:
+                purchased_at = self._parse_api_datetime(purchase.purchase_date)
+                if purchased_at is None:
+                    logging.warning(f"Purchase {purchase.invoice_id} has invalid purchase date {purchase.purchase_date!r}; keeping pending")
+                    self.failed_topics[invoice_id] = datetime.now()  # 5-min backoff, stays retryable
+                    return
+                if purchased_at < self.installed_at:
+                    # Genuinely pre-install: safe to acknowledge.
+                    # Stop legacy pending rows from being retried forever.
+                    self.purchase_manager.mark_purchase_processed(purchase.invoice_id)
+                    return
             if purchase and self.purchase_manager.add_purchase(purchase):
                 logging.info(f"Purchase: {purchase.invoice_id} - {purchase.buyer_email}")
                 delivered = await self.create_topic_for_purchase(purchase)
@@ -411,6 +427,11 @@ class BotService:
             else:
                 await asyncio.sleep(2)
                 topic_id, cooldown = await self.telegram_bot.create_topic(topic_name)
+                if topic_id is None and cooldown is None:
+                    # BadRequest/Forbidden (e.g. bot lost admin): permanent rejection.
+                    logging.error(f"Permanent Telegram rejection creating topic for {purchase.invoice_id}")
+                    self.failed_topics[purchase.invoice_id] = datetime.now()
+                    return False
             
             if topic_id is not None:
                 if not existing_topic:
@@ -430,7 +451,7 @@ class BotService:
                 
                 msg = f"{header}\n\n"
                 
-                safe_name = purchase.name.replace('<', '').replace('>', '').replace('&', '&amp;')
+                safe_name = html.escape(purchase.name, quote=False)
                 msg += f"{_('noti_product')} {safe_name}\n"
                 if getattr(purchase, 'item_id', 0): msg += f"{_('noti_item_id')} {purchase.item_id}\n"
                 msg += f"{_('noti_invoice')} <a href='{order_link}'>{purchase.invoice_id}</a>\n"
@@ -438,42 +459,45 @@ class BotService:
                 
                 # Prices Block
                 msg += f"\n💰 <b>{_('noti_prices')}</b>\n"
-                amt_rub = purchase.amount_rub if getattr(purchase, 'amount_rub', 0) > 0 else purchase.amount
-                amt_usd = purchase.amount_usd if getattr(purchase, 'amount_usd', 0) > 0 else round(purchase.amount / 90.0, 2)
-                msg += f"• RUB: {amt_rub}\n"
-                msg += f"• USD: {amt_usd}\n"
+                amount_rub = getattr(purchase, 'amount_rub', 0)
+                amount_usd = getattr(purchase, 'amount_usd', 0)
+                if amount_rub > 0:
+                    msg += f"• RUB: {amount_rub}\n"
+                if amount_usd > 0 or purchase.currency_type == 'USD':
+                    amt_usd = amount_usd if amount_usd > 0 else round(purchase.amount / self.usd_rub_rate, 2)
+                    msg += f"• USD: {amt_usd}\n"
                 
                 # Details Block
                 state = purchase.invoice_state
                 # Force "In progress" status default since auto-complete is off
                 status_text = _('noti_status_processing') if state in (0, 1) else _('noti_status_done')
-                profit = purchase.profit if getattr(purchase, 'profit', 0) > 0 else purchase.amount
-                
-                # --- NEW: Calculate the estimated USD profit dynamically ---
-                if purchase.currency_type == 'RUB':
-                    profit_usd = round(profit / self.usd_rub_rate, 2)
-                    profit_str = f"{profit} RUB (~{profit_usd} USD)"
-                elif purchase.currency_type == 'USD':
-                    profit_str = f"{profit} USD"
-                else:
-                    profit_str = f"{profit} {purchase.currency_type}"
+                profit = purchase.profit
                 
                 msg += f"\n📊 <b>{_('noti_details')}</b>\n"
                 msg += f"{_('noti_total')} {purchase.amount} {purchase.currency_type}\n"
                 msg += f"{_('noti_status')} {status_text}\n"
-                msg += f"{_('noti_profit')} {profit_str}\n"
+                if profit > 0:
+                    # --- Calculate the estimated USD profit dynamically ---
+                    if purchase.currency_type == 'RUB':
+                        profit_usd = round(profit / self.usd_rub_rate, 2)
+                        profit_str = f"{profit} RUB (~{profit_usd} USD)"
+                    elif purchase.currency_type == 'USD':
+                        profit_str = f"{profit} USD"
+                    else:
+                        profit_str = f"{profit} {purchase.currency_type}"
+                    msg += f"{_('noti_profit')} {profit_str}\n"
                 
                 # Buyer Info Block
                 msg += f"\n👤 <b>{_('noti_buyer_info')}</b>\n"
-                if purchase.payment_method: msg += f"{_('noti_payment')} {purchase.payment_method}\n"
-                if purchase.buyer_account: msg += f"{_('noti_account')} {purchase.buyer_account}\n"
-                if purchase.buyer_email: msg += f"{_('noti_email')} {purchase.buyer_email}\n"
-                if getattr(purchase, 'payment_aggregator', ''): msg += f"{_('noti_aggregator')} {purchase.payment_aggregator}\n"
+                if purchase.payment_method: msg += f"{_('noti_payment')} {html.escape(purchase.payment_method, quote=False)}\n"
+                if purchase.buyer_account: msg += f"{_('noti_account')} {html.escape(purchase.buyer_account, quote=False)}\n"
+                if purchase.buyer_email: msg += f"{_('noti_email')} {html.escape(purchase.buyer_email, quote=False)}\n"
+                if getattr(purchase, 'payment_aggregator', ''): msg += f"{_('noti_aggregator')} {html.escape(purchase.payment_aggregator, quote=False)}\n"
                 
                 # Options Block
                 options_text, options_list = await self.get_purchase_options_with_list(purchase.invoice_id)
                 if options_text: 
-                    safe_options = options_text.replace('<', '').replace('>', '').replace('&', '&amp;')
+                    safe_options = html.escape(options_text, quote=False)
                     msg += f"\n⚙️ <b>{_('noti_options')}</b>\n{safe_options}\n"
                 
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
@@ -484,6 +508,9 @@ class BotService:
                     purchase_invoice_id=purchase.invoice_id,
                 )
                 if not notification_delivered:
+                    if not self._flood_active():
+                        logging.error(f"Permanent Telegram rejection delivering notification for {purchase.invoice_id}")
+                        self.failed_topics[purchase.invoice_id] = datetime.now()
                     return False
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
                 
@@ -545,9 +572,10 @@ class BotService:
             
             def get_timestamp(msg):
                 ts = msg.get('date_written', msg.get('timestamp', msg.get('created_at', msg.get('date', msg.get('time', '')))))
-                if not ts: return datetime.min
-                try: return datetime.fromisoformat(str(ts).replace('Z', '+00:00').replace('+03:00', ''))
-                except: return datetime.min
+                parsed = self._parse_api_datetime(str(ts)) if ts else None
+                # _parse_api_datetime always returns aware-UTC (or None), so a
+                # mixed Z/+03:00 feed sorts without a naive-vs-aware TypeError.
+                return parsed if parsed is not None else datetime.min.replace(tzinfo=timezone.utc)
             
             all_messages.sort(key=get_timestamp)
             logging.info(f"Loaded {len(all_messages)} messages for topic {topic_id}")
@@ -757,7 +785,49 @@ class BotService:
         await self.telegram_bot.stop()
         logging.info("Bot stopped")
     
-    async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None, parse_mode: str = None, reply_markup = None, purchase_invoice_id: int = None, effect: str = "telegram") -> bool:
+    def _flood_active(self) -> bool:
+        until = getattr(self, 'message_flood_control_until', None)
+        return bool(until and datetime.now() < until)
+
+    def _queue_pending_message(self, *, text, topic_id, chat_id, message_id, parse_mode, reply_markup, purchase_invoice_id, effect, dedup_key=None, review=None):
+        """Append to the flood queue unless an equivalent item is already queued.
+
+        Chat-message mirrors dedup on (chat_id, message_id, effect, text) so a
+        force-reload variant stays distinct; purchase notifications (chat_id
+        is None, no dedup_key) dedup on purchase_invoice_id+topic_id; keyless
+        review sends dedup on the explicit dedup_key.
+        """
+        if chat_id and message_id:
+            duplicate = any(
+                queued.get('chat_id') == chat_id
+                and queued.get('message_id') == message_id
+                and queued.get('effect') == effect
+                and queued.get('text') == text
+                for queued in self.pending_messages
+            )
+        elif dedup_key is not None:
+            duplicate = any(
+                queued.get('dedup_key') == dedup_key
+                for queued in self.pending_messages
+            )
+        else:
+            duplicate = purchase_invoice_id is not None and any(
+                queued.get('purchase_invoice_id') == purchase_invoice_id
+                and queued.get('topic_id') == topic_id
+                and queued.get('effect') == effect
+                for queued in self.pending_messages
+            )
+        if duplicate:
+            return
+        self.pending_messages.append({
+            'text': text, 'topic_id': topic_id, 'chat_id': chat_id,
+            'message_id': message_id, 'timestamp': datetime.now(),
+            'parse_mode': parse_mode, 'reply_markup': reply_markup,
+            'purchase_invoice_id': purchase_invoice_id,
+            'effect': effect, 'dedup_key': dedup_key, 'review': review,
+        })
+
+    async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None, parse_mode: str = None, reply_markup = None, purchase_invoice_id: int = None, effect: str = "telegram", dedup_key: str = None, review=None) -> bool:
         """Updated to support reply_markup for clickable order buttons"""
         try:
             # Message ids are scoped to a GGSel chat.
@@ -768,17 +838,12 @@ class BotService:
                     return True
 
             if self.message_flood_control_until and datetime.now() < self.message_flood_control_until:
-                if purchase_invoice_id is None or not any(
-                    queued.get('purchase_invoice_id') == purchase_invoice_id
-                    for queued in self.pending_messages
-                ):
-                    self.pending_messages.append({
-                        'text': text, 'topic_id': topic_id, 'chat_id': chat_id,
-                        'message_id': message_id, 'timestamp': datetime.now(),
-                        'parse_mode': parse_mode, 'reply_markup': reply_markup,
-                        'purchase_invoice_id': purchase_invoice_id,
-                        'effect': effect,
-                    })
+                self._queue_pending_message(
+                    text=text, topic_id=topic_id, chat_id=chat_id, message_id=message_id,
+                    parse_mode=parse_mode, reply_markup=reply_markup,
+                    purchase_invoice_id=purchase_invoice_id, effect=effect,
+                    dedup_key=dedup_key, review=review,
+                )
                 return False
             self.message_flood_control_until = None
             
@@ -792,17 +857,12 @@ class BotService:
                 
             elif cooldown:
                 self.message_flood_control_until = datetime.now() + timedelta(seconds=cooldown + 5)
-                if purchase_invoice_id is None or not any(
-                    queued.get('purchase_invoice_id') == purchase_invoice_id
-                    for queued in self.pending_messages
-                ):
-                    self.pending_messages.append({
-                        'text': text, 'topic_id': topic_id, 'chat_id': chat_id,
-                        'message_id': message_id, 'timestamp': datetime.now(),
-                        'parse_mode': parse_mode, 'reply_markup': reply_markup,
-                        'purchase_invoice_id': purchase_invoice_id,
-                        'effect': effect,
-                    })
+                self._queue_pending_message(
+                    text=text, topic_id=topic_id, chat_id=chat_id, message_id=message_id,
+                    parse_mode=parse_mode, reply_markup=reply_markup,
+                    purchase_invoice_id=purchase_invoice_id, effect=effect,
+                    dedup_key=dedup_key, review=review,
+                )
             elif chat_id and message_id:
                 # A non-rate-limit Telegram rejection is terminal. Re-polling
                 # cannot repair it and must not create a hot retry loop.
@@ -827,12 +887,23 @@ class BotService:
             success = await self.send_message_with_cooldown(
                 msg['text'], msg['topic_id'], msg.get('chat_id'),
                 msg.get('message_id'), msg.get('parse_mode'), msg.get('reply_markup'),
-                msg.get('purchase_invoice_id'), msg.get('effect', 'telegram')
+                msg.get('purchase_invoice_id'), msg.get('effect', 'telegram'),
+                msg.get('dedup_key'), msg.get('review')
             )
-            if success and msg.get('purchase_invoice_id') is not None:
-                if not self.purchase_manager.mark_purchase_processed(msg['purchase_invoice_id']):
-                    logging.error(
-                        f"Could not persist queued purchase delivery {msg['purchase_invoice_id']}"
+            if success:
+                if msg.get('purchase_invoice_id') is not None:
+                    if not self.purchase_manager.mark_purchase_processed(msg['purchase_invoice_id']):
+                        logging.error(
+                            f"Could not persist queued purchase delivery {msg['purchase_invoice_id']}"
+                        )
+                if msg.get('review') is not None:
+                    # The review poll loop won't observe this delivery until
+                    # its next pass; record it now so the message isn't sent
+                    # twice (once here, once by the poll).
+                    review_id, review_hash, review_effect = msg['review']
+                    self._set_review_effect_status(
+                        review_id, review_hash, review_effect,
+                        self.message_manager.COMPLETED,
                     )
             if not success and self.message_flood_control_until:
                 # The current message was re-queued by the send helper; retain
@@ -922,6 +993,9 @@ class BotService:
         
         chat_id = query.message.chat.id
         message_id = query.message.message_id
+        # Any menu navigation cancels a pending text-input prompt; branches that
+        # legitimately need input re-set awaiting_input below.
+        self.awaiting_input.pop(chat_id, None)
         
         if data == "auto_menu": await self.show_auto_menu(chat_id, message_id)
         elif data == "check_balance":
@@ -1066,7 +1140,7 @@ class BotService:
     async def show_csv_menu(self, chat_id: int, message_id: int):
         enabled = self.autoresponder.is_csv_mode_enabled()
         rules = self.autoresponder.get_csv_rules()
-        text = f"{_('csv_title')}\n\n{_('auto_status')} ✅ {_('enabled') if enabled else '❌ ' + _('disabled')}\n\n{_('csv_desc')}\n\n"
+        text = f"{_('csv_title')}\n\n{_('auto_status')} {'✅' if enabled else '❌'} {_('enabled') if enabled else _('disabled')}\n\n{_('csv_desc')}\n\n"
         
         if rules:
             text += f"📋 Rules ({len(rules)}):\n"
@@ -1262,7 +1336,9 @@ class BotService:
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
             if purchase:
                 self.purchase_manager.add_purchase(purchase)
-                await self.create_topic_for_purchase(purchase)
+                delivered = await self.create_topic_for_purchase(purchase)
+                if delivered:
+                    self.purchase_manager.mark_purchase_processed(purchase.invoice_id)
                 if self.flood_control_until: break
             await asyncio.sleep(1.0)
     
@@ -1362,8 +1438,16 @@ class BotService:
             
             notification_status = self._get_review_effect_status(review_id, review_hash, "telegram_notification")
             if notification_status == self.message_manager.PENDING:
-                if await self.send_message_with_cooldown(msg, topic_id):
+                sent = await self.send_message_with_cooldown(
+                    msg, topic_id,
+                    dedup_key=f"review:{review_id}:{review_hash}:telegram_notification",
+                    review=(review_id, review_hash, "telegram_notification"),
+                )
+                if sent:
                     self._set_review_effect_status(review_id, review_hash, "telegram_notification", self.message_manager.COMPLETED)
+                elif not self._flood_active():
+                    # Permanent Telegram rejections can't be repaired by re-polling.
+                    self._set_review_effect_status(review_id, review_hash, "telegram_notification", self.message_manager.PERMANENT_FAILURE)
 
             auto_response = self.autoresponder.get_review_response(review_type)
             customer_status = self._get_review_effect_status(review_id, review_hash, "customer_reply")
@@ -1389,8 +1473,16 @@ class BotService:
             mirror_status = self._get_review_effect_status(review_id, review_hash, "reply_mirror")
             if mirror_status == self.message_manager.PENDING:
                 if auto_response and customer_status == self.message_manager.COMPLETED:
-                    if await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id):
+                    sent = await self.send_message_with_cooldown(
+                        f"📤 {auto_response}", topic_id,
+                        dedup_key=f"review:{review_id}:{review_hash}:reply_mirror",
+                        review=(review_id, review_hash, "reply_mirror"),
+                    )
+                    if sent:
                         self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.COMPLETED)
+                    elif not self._flood_active():
+                        # Permanent Telegram rejections can't be repaired by re-polling.
+                        self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.PERMANENT_FAILURE)
                 elif not auto_response or customer_status == self.message_manager.PERMANENT_FAILURE:
                     self._set_review_effect_status(review_id, review_hash, "reply_mirror", self.message_manager.COMPLETED)
 
@@ -1567,8 +1659,13 @@ class BotService:
                             f"🕒 Time: `{current_time}`"
                         )
 
-                        await self.telegram_bot.send_message(alert, -1, parse_mode="Markdown")
-                        self.last_available_balance = current_avail
+                        sent, cooldown = await self.telegram_bot.send_message(alert, -1, parse_mode="Markdown")
+                        if sent or not cooldown:
+                            # Advance the baseline on success or on a permanent
+                            # rejection (no cooldown): retrying a permanent
+                            # failure would re-alert every 60s cycle forever.
+                            # Transient failures keep the baseline for a retry.
+                            self.last_available_balance = current_avail
                 
             except Exception:
                 # Silently pass connection drops so it doesn't spam the logs

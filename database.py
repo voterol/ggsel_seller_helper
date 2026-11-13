@@ -1,3 +1,5 @@
+import logging
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +35,13 @@ class Database:
         self.db_path = str(db_path)
         self.last_backup_path: Optional[str] = None
         self.init_db()
+        # The db holds buyer PII; restrict to owner-only once, at the single
+        # init point where the file is guaranteed to exist.
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError as e:
+            # A silent no-op would leave buyer PII readable; make it visible.
+            logging.warning(f"Could not restrict database file permissions ({self.db_path}): {e}")
 
     def _backup(self) -> str:
         """Create a consistent pre-migration copy without modifying the source."""
