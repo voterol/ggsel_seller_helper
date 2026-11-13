@@ -5,7 +5,7 @@ import types
 import unittest
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, call, patch
 from database import Database
 from message_manager import MessageManager
@@ -174,6 +174,9 @@ class BotServiceReliabilityTests(unittest.TestCase):
         from purchase_manager import Purchase
         purchase = Purchase(123, 1, 2, "cart", "item", 10, "USD", 1, "2024-01-02T00:00:00Z", "", "e", "a", "1", "", "", "card", "", "now")
         self.assertFalse(asyncio.run(service.create_topic_for_purchase(purchase)))
+        # The failed delivery records a 5-minute backoff; simulate its expiry
+        # so the required notification is retried.
+        service.failed_topics.clear()
         self.assertTrue(asyncio.run(service.create_topic_for_purchase(purchase)))
         service.telegram_bot.create_topic.assert_not_called()
         self.assertEqual(service.send_message_with_cooldown.await_count, 2)
@@ -269,12 +272,16 @@ class BotServiceReliabilityTests(unittest.TestCase):
         service.autoresponder = Mock()
         service.autoresponder.get_review_response.return_value = None
         service.send_message_with_cooldown = AsyncMock(return_value=False)
+        # A bare False is now a permanent rejection; model the retryable case
+        # instead by holding the flood window open.
+        service.message_flood_control_until = datetime.now() + timedelta(seconds=60)
         review = {"id": "3", "invoice_id": 9, "type": "good", "info": "ok"}
         topic = {9: {"topic_id": 4}}
 
         self.loop.run_until_complete(service._process_reviews([review], topic, None))
         self.assertNotIn("3", service.processed_reviews)
 
+        service.message_flood_control_until = None
         service.send_message_with_cooldown.return_value = True
         self.loop.run_until_complete(service._process_reviews([review], topic, None))
         self.assertEqual(service.processed_reviews["3"], "good:ok")

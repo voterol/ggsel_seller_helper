@@ -76,6 +76,11 @@ def setup_logging():
             logging.StreamHandler(sys.stdout)
         ]
     )
+    # The log contains buyer emails; keep it owner-only when possible.
+    try:
+        os.chmod('ggsel_bot.log', 0o600)
+    except OSError as e:
+        logging.warning(f"Could not restrict log file permissions (ggsel_bot.log): {e}")
     # Silence noisy libraries
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('telegram').setLevel(logging.WARNING)

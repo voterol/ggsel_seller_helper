@@ -22,7 +22,8 @@ class TelegramBot:
         self.allowed_user_ids = frozenset(getattr(config, 'telegram_allowed_user_ids', frozenset()))
         self.application = None
         self.topic_message_handler = None
-        self.callback_handler = None 
+        self.callback_handler = None
+        self.awaiting_input = None  # wired by bot_service; menu navigation cancels text prompts
         self.general_message_handler = None
         self.history_handler = None 
         self.options_handler = None 
@@ -33,6 +34,7 @@ class TelegramBot:
         
     def set_topic_message_handler(self, h): self.topic_message_handler = h
     def set_callback_handler(self, h): self.callback_handler = h
+    def set_awaiting_input(self, d): self.awaiting_input = d
     def set_general_message_handler(self, h): self.general_message_handler = h
     def set_history_handler(self, h): self.history_handler = h
     def set_options_handler(self, h): self.options_handler = h
@@ -209,6 +211,10 @@ class TelegramBot:
             return
         try: await query.answer()
         except TelegramError: pass
+        # Short-circuited menus below never reach bot_service.handle_callback,
+        # so cancel a pending text-input prompt here for the same semantics.
+        if self.awaiting_input is not None and query.message:
+            self.awaiting_input.pop(query.message.chat.id, None)
         if query.data == "close":
             await query.message.delete()
             return
@@ -238,6 +244,9 @@ class TelegramBot:
             result = await self.bot.create_forum_topic(chat_id=self.group_id, name=topic_name[:120])
             return result.message_thread_id, None
         except RetryAfter as e: return None, e.retry_after
+        except (BadRequest, Forbidden):
+            # Permanent rejections (e.g. bot lost admin) must not be retried.
+            return None, None
         except Exception: return None, 60
 
     async def check_topic_exists(self, topic_id: int, topic_name: str) -> bool:

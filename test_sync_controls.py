@@ -133,7 +133,8 @@ class SyncControlTests(unittest.TestCase):
 
         result = self.loop.run_until_complete(service._send_customer_message(123, "hello"))
 
-        self.assertEqual(result, (False, None))
+        # A distinguishable token lets the operator UI say "paused", not "error".
+        self.assertEqual(result, (False, "sync_paused"))
         service.ggsel_api.send_message.assert_not_called()
 
     def test_stop_waits_for_admitted_customer_write(self):
